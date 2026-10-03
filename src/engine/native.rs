@@ -327,6 +327,8 @@ impl<B: Backend> Engine<B> {
         let mut commits = std::mem::take(&mut *self.commits.borrow_mut());
         commits.clear();
         super::drain_visible(&mut self.surfaces.borrow_mut(), time, &mut commits);
+        // Completions may arrive while render is in flight, before its reply.
+        self.waker.arm();
         if let Err(error) = self.tx.send(Message::Render {
             time,
             commits,
@@ -348,7 +350,6 @@ impl<B: Backend> Engine<B> {
         *self.commits.borrow_mut() = reply.commits;
         let (next, stats) = reply.result?;
         *self.stats.borrow_mut() = stats;
-        self.waker.arm();
         Ok(next)
     }
 
@@ -525,5 +526,53 @@ impl<B: Backend> Drop for Engine<B> {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{Null, NullConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn completion_before_render_reply_wakes_the_host() {
+        let (events, _) = std::sync::mpsc::channel();
+        let mut engine = Engine::<Null>::new(NullConfig {
+            events,
+            reject: std::collections::HashSet::default(),
+        })
+        .unwrap();
+        // Replace only the render transport. The real native render method
+        // receives a completion after submission but before its reply.
+        engine.tx.send(Message::Shutdown).unwrap();
+        engine.thread.take().unwrap().join().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        engine.tx = tx;
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        engine.set_waker({
+            let wake_count = Arc::clone(&wake_count);
+            move || {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        engine.waker.wake();
+        let waker = Arc::clone(&engine.waker);
+        engine.thread = Some(std::thread::spawn(move || {
+            let Message::Render { commits, reply, .. } = rx.recv().unwrap() else {
+                panic!("expected render");
+            };
+            waker.wake();
+            reply
+                .send(RenderReply {
+                    result: Ok((Next::Idle, FrameStats::default())),
+                    commits,
+                    sender: reply.clone(),
+                })
+                .unwrap();
+            assert!(matches!(rx.recv().unwrap(), Message::Shutdown));
+        }));
+        assert_eq!(engine.render(FrameTime::now()).unwrap(), Next::Idle);
+        assert_eq!(wake_count.load(Ordering::Relaxed), 2);
     }
 }

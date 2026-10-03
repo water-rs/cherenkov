@@ -26,6 +26,7 @@
 
 #[path = "src/render/bindings.rs"]
 mod bindings;
+mod deployment;
 
 #[path = "build_tile.rs"]
 mod tile;
@@ -865,6 +866,7 @@ fn apple_target() -> Option<AppleTarget> {
         .strip_prefix(&format!("{deployment_variable}="))
         .expect("rustc reports the target platform's deployment variable")
         .to_owned();
+    deployment::require_floor(&deployment_version);
     Some(AppleTarget {
         sdk,
         deployment_variable,

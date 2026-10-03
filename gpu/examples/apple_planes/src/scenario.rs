@@ -10,6 +10,8 @@ use crate::pattern::{HEIGHT, WIDTH};
 /// One launch-time scenario, from the `--scenario` argument.
 #[derive(Clone, Copy, Debug)]
 pub enum Scenario {
+    /// Recorded-content policy matrix shared with Android.
+    Recorded(crate::recorded::Spec),
     /// The video alone, filling the screen width — promoted.
     Overlay,
     /// The identical video under an empty layer painted above it at
@@ -19,7 +21,7 @@ pub enum Scenario {
 }
 
 /// The scenario names `parse` accepts, for its error message.
-pub const NAMES: &str = "overlay|in-engine";
+pub const NAMES: &str = "overlay|in-engine|static:side:count:lifetime:plane|engine|animated:side:count:lifetime:plane|engine";
 
 impl Scenario {
     /// Parses the `--scenario` value; unknown names are an error — the
@@ -28,6 +30,9 @@ impl Scenario {
     /// # Errors
     /// On a name outside [`NAMES`].
     pub fn parse(name: &str) -> Result<Self, String> {
+        if let Some(spec) = crate::recorded::Spec::parse(name) {
+            return Ok(Self::Recorded(spec));
+        }
         match name {
             "overlay" => Ok(Self::Overlay),
             "in-engine" => Ok(Self::InEngine),
@@ -39,6 +44,13 @@ impl Scenario {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Recorded(spec) => {
+                if spec.animated {
+                    "animated"
+                } else {
+                    "static"
+                }
+            }
             Self::Overlay => "overlay",
             Self::InEngine => "in-engine",
         }
@@ -61,6 +73,13 @@ impl Scenario {
     /// `TranslucentAbove` while drawing nothing itself — identical
     /// pixels, identical producer work.
     pub fn build(self, surface: &Surface<Gpu>) -> Built {
+        if let Self::Recorded(spec) = self {
+            return Built {
+                video: None,
+                rest: Vec::new(),
+                recorded: Some(crate::recorded::Scene::new(surface, spec)),
+            };
+        }
         let video = surface.layer();
         let mut rest = Vec::new();
         if matches!(self, Self::InEngine) {
@@ -75,7 +94,11 @@ impl Scenario {
                 tx[root].push(shade);
             }
         });
-        Built { video, rest }
+        Built {
+            video: Some(video),
+            rest,
+            recorded: None,
+        }
     }
 
     /// Recomputes the video layer's placement after a resize.
@@ -87,7 +110,9 @@ impl Scenario {
 /// A built scenario's live layers.
 pub struct Built {
     /// The layer the video installs on.
-    pub video: Layer,
+    pub video: Option<Layer>,
+    /// Recorded workload when no external-frame producer is used.
+    pub recorded: Option<crate::recorded::Scene>,
     /// Layers the tree needs held for the run (a dropped handle queues
     /// its `Remove`): `in-engine`'s shade layer.
     pub rest: Vec<Layer>,

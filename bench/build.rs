@@ -40,7 +40,60 @@ fn lockfile_packages(text: &str) -> Vec<(String, String, Option<String>)> {
     out
 }
 
+/// `CHERENKOV_GIT_SHA` is `git rev-parse HEAD`. The bench is a path
+/// crate, so Cargo.lock has no revision for it; the external-cost
+/// report prints this instead of a hand-typed `--head`.
+fn emit_git_sha() {
+    let manifest = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
+    let repo = manifest.join("..");
+    let dotgit = repo.join(".git");
+    println!("cargo:rerun-if-changed={}", dotgit.display());
+    let gitdir = if dotgit.is_file() {
+        std::fs::read_to_string(&dotgit).ok().and_then(|text| {
+            text.strip_prefix("gitdir:").map(|dir| {
+                let dir = Path::new(dir.trim());
+                if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    repo.join(dir)
+                }
+            })
+        })
+    } else if dotgit.is_dir() {
+        Some(dotgit)
+    } else {
+        None
+    };
+    if let Some(gitdir) = gitdir {
+        let head = gitdir.join("HEAD");
+        println!("cargo:rerun-if-changed={}", head.display());
+        if let Ok(text) = std::fs::read_to_string(&head)
+            && let Some(r) = text.strip_prefix("ref:")
+        {
+            println!("cargo:rerun-if-changed={}", gitdir.join(r.trim()).display());
+        }
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap_or_else(|err| panic!("git rev-parse HEAD failed to start: {err}"));
+    assert!(
+        output.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sha = String::from_utf8(output.stdout).expect("git sha is utf-8");
+    let sha = sha.trim();
+    assert!(
+        sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "git rev-parse HEAD returned {sha:?}"
+    );
+    println!("cargo:rustc-env=CHERENKOV_GIT_SHA={sha}");
+}
+
 fn main() {
+    emit_git_sha();
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let lock = Path::new(&manifest).join("../Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock.display());

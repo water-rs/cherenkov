@@ -75,6 +75,8 @@ which wgpu-hal advertises unconditionally there.
   Cargo target, so the metallib has the same OS floor as the Rust binary.
   Explicit `MACOSX_DEPLOYMENT_TARGET` and `IPHONEOS_DEPLOYMENT_TARGET`
   settings participate in that resolution and invalidate the build script.
+  The workspace defaults both to 26.0, matching the native Apple contract
+  in `docs/api.md` and both iOS host manifests.
 - wasm32 targets skip the toolchain entirely (nothing embeds the artifacts);
   the WGSL is still parsed and validated.
 

@@ -1,6 +1,6 @@
 import UIKit
 
-/// Scene lifecycle is mandatory on iOS 26 — an app that only implements
+/// The iOS 27 host uses the scene lifecycle. An app that only implements
 /// `UIApplicationDelegate` is killed by
 /// `UIKitEvaluateRuntimeIssueForNoSceneLifecycleAdoption`. The scene
 /// owns the window and the foreground brightness transitions.

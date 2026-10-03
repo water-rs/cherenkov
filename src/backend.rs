@@ -235,6 +235,16 @@ pub trait Renderer: 'static {
         surface: SurfaceId,
     ) -> impl core::future::Future<Output = Result<Readback, RenderError>>;
 
+    /// Layers whose last successful render handed every running property
+    /// track to the system compositor. The backend must withdraw
+    /// ownership on demotion, an unsupported track, or failed presentation.
+    /// Owned tracks remain in the tree for sampling and retargeting, but do
+    /// not request display-link frames. Recorded operand animations are
+    /// independent and always remain engine-driven.
+    fn owned_animations(&self, _surface: SurfaceId) -> &[LayerId] {
+        &[]
+    }
+
     /// The backend's current memory usage.
     fn memory(&self) -> MemoryUsage;
 

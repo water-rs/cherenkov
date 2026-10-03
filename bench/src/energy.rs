@@ -1,6 +1,6 @@
 //! Energy metering for `measure --energy`.
 //!
-//! Two sources feed the same [`EnergyReport`]:
+//! Platform sources feed the same [`EnergyReport`]:
 //!
 //! - **Android ODPM** — the on-device power monitors under
 //!   `/sys/bus/iio/devices/iio:device*/` (Pixel-class devices). Every
@@ -11,6 +11,9 @@
 //! - **macOS `powermetrics`** — `sudo -n powermetrics --samplers
 //!   cpu_power,gpu_power -i <ms> --format plist` spawned for exactly the
 //!   measured window; its per-sample CPU/GPU/ANE energies are summed.
+//! - **iOS process counter** — `proc_pid_rusage` v6 reports cumulative
+//!   `ri_energy_nj`. This measures the calling process, excluding the
+//!   display and other processes such as the system compositor.
 //!
 //! [`Meter::probe`] runs before the engine is created so `--energy`
 //! fails fast — naming the path and the permission — when the meter
@@ -21,6 +24,9 @@ use std::time::{Duration, Instant};
 use crate::BenchError;
 use crate::report::{EnergyReport, RailEnergy};
 
+#[cfg(target_os = "ios")]
+pub mod ios;
+
 /// The meter open for one measured window.
 pub enum Meter {
     /// Android ODPM: holds the pre-window rail snapshot and the instant
@@ -28,6 +34,9 @@ pub enum Meter {
     Odpm(odpm::Snapshot, Instant),
     /// macOS `powermetrics`: the running subprocess.
     PowerMetrics(powermetrics::Run),
+    /// iOS process energy counter, in nanojoules, sampled at window boundaries.
+    #[cfg(target_os = "ios")]
+    Ios(ios::Snapshot),
 }
 
 /// The result of a finished metering window.
@@ -36,15 +45,16 @@ pub struct Outcome {
     /// The serialized energy report.
     pub report: EnergyReport,
     /// `powermetrics` `thermal_pressure` from its last decoded sample —
-    /// the only thermal-status source on macOS. `None` on Android
+    /// the only thermal-status source on macOS. `None` on Android and iOS
     /// (conditions are read separately).
     pub thermal_pressure: Option<String>,
 }
 
+#[cfg(not(target_os = "ios"))]
 fn unsupported() -> BenchError {
     BenchError::Engine(
         "energy: --energy is not supported on this platform \
-         (Android ODPM rails or macOS powermetrics required)"
+         (Android ODPM rails, macOS powermetrics or iOS process counters required)"
             .into(),
     )
 }
@@ -57,8 +67,13 @@ impl Meter {
     /// # Errors
     /// [`BenchError::Engine`] naming the path and the permission that
     /// blocks the meter: the `iio:device*` rail files on Android,
-    /// `sudo -n` on macOS, or the platform itself elsewhere.
+    /// `sudo -n` on macOS, `proc_pid_rusage` on iOS, or the platform itself elsewhere.
     pub fn probe() -> Result<(), BenchError> {
+        #[cfg(target_os = "ios")]
+        {
+            ios::snapshot().map(|_| ())
+        }
+        #[cfg(not(target_os = "ios"))]
         if cfg!(target_os = "android") {
             odpm::snapshot().map(|_| ())
         } else if cfg!(target_os = "macos") {
@@ -77,6 +92,12 @@ impl Meter {
     /// # Errors
     /// Same as [`Meter::probe`].
     pub fn begin(window_hint: Duration) -> Result<Self, BenchError> {
+        #[cfg(target_os = "ios")]
+        {
+            let _ = window_hint;
+            ios::snapshot().map(Self::Ios)
+        }
+        #[cfg(not(target_os = "ios"))]
         if cfg!(target_os = "android") {
             Ok(Self::Odpm(odpm::snapshot()?, Instant::now()))
         } else if cfg!(target_os = "macos") {
@@ -115,6 +136,11 @@ impl Meter {
                 })
             }
             Self::PowerMetrics(run) => run.finish(start, end, frames),
+            #[cfg(target_os = "ios")]
+            Self::Ios(before) => Ok(Outcome {
+                report: ios::report(&before, &ios::snapshot()?, end - start, frames)?,
+                thermal_pressure: None,
+            }),
         }
     }
 }

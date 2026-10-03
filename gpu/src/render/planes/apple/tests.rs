@@ -11,6 +11,26 @@ fn rect() -> Rect {
 }
 
 #[test]
+fn motionless_placement_needs_no_animation_transaction() {
+    let mut state = super::MotionState::default();
+    assert!(!state.update(&[]));
+    for _ in 0..3 {
+        state.placed(false);
+        assert!(!state.update(&[]));
+    }
+}
+
+#[test]
+fn a_rebuilt_motion_tree_reinstalls_unchanged_tracks() {
+    let mut state = super::MotionState::default();
+    assert!(!state.update(&[]));
+    state.placed(true);
+    assert!(state.update(&[]));
+    state.placed(false);
+    assert!(!state.update(&[]));
+}
+
+#[test]
 fn a_rect_is_a_layer_clip() {
     assert_eq!(
         LayerClip::of(&ShapeData::Rect(rect())),

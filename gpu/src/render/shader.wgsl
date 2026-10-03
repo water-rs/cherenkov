@@ -456,7 +456,7 @@ fn paint_backdrop(i: u32, pixel: vec2<f32>) -> vec4<f32> {
     // distance and unit outward normal in device space, the same
     // J^-T math the clip coverage block uses.
     let pc = apply(inst.clip_inv, pixel);
-    let sample = sdf_sample(inst.clip, pc);
+    let sample = sdf_sample(inst.clip, pc, false);
     let g = sample.gradient;
     let ci = inst.clip_inv;
     let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
@@ -528,10 +528,10 @@ fn fs_simple(in: VsOut, classified: bool) -> vec4<f32> {
                 } else if rr > in.affine1.w {
                     cov = 0.0;
                 } else {
-                    cov = shape_coverage(s, in.local, m);
+                    cov = shape_coverage(s, in.local, m, classified);
                 }
             } else {
-                cov = shape_coverage(s, in.local, m);
+                cov = shape_coverage(s, in.local, m, classified);
             }
         }
     }
@@ -667,7 +667,7 @@ fn fs_shadow(in: VsOut) -> vec4<f32> {
     let sigma = in.params.x;
     var cov: f32;
     if sigma < 0.25 {
-        cov = shape_coverage(s, in.local, m);
+        cov = shape_coverage(s, in.local, m, false);
     } else {
         cov = shadow(s, in.local, sigma);
     }
@@ -686,13 +686,13 @@ fn fs_full(in: VsOut) -> vec4<f32> {
     var cov: f32;
     switch in.meta_.x {
         case KIND_STROKE_OFFSET: {
-            cov = shape_coverage(s, in.local, m);
+            cov = shape_coverage(s, in.local, m, false);
             if (flags & FLAG_HAS_INNER) != 0u {
-                cov -= shape_coverage(instances[i].inner, in.local, m);
+                cov -= shape_coverage(instances[i].inner, in.local, m, false);
             }
         }
         case KIND_STROKE_DIST: {
-            let sample = sdf_sample(s, in.local);
+            let sample = sdf_sample(s, in.local, false);
             let d = sample.distance;
             let g = sample.gradient;
             let v = device_grad_vec(m, g.xy);
@@ -705,7 +705,7 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         case KIND_SHADOW: {
             let sigma = in.params.x;
             if sigma < 0.25 {
-                cov = shape_coverage(s, in.local, m);
+                cov = shape_coverage(s, in.local, m, false);
             } else {
                 cov = shadow(s, in.local, sigma);
             }
@@ -718,7 +718,7 @@ fn fs_full(in: VsOut) -> vec4<f32> {
             cov = 1.0;
         }
         default: {
-            cov = shape_coverage(s, in.local, m);
+            cov = shape_coverage(s, in.local, m, false);
         }
     }
     cov *= clip_mask_coverage(in);

@@ -222,7 +222,7 @@ struct DistanceSample {
     gradient: vec4<f32>,
 }
 
-fn sdf_sample(s: Shape, p: vec2<f32>) -> DistanceSample {
+fn sdf_sample(s: Shape, p: vec2<f32>, specialize_quadratic: bool) -> DistanceSample {
     let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
     let right = p.x > 0.0;
     let bottom = p.y > 0.0;
@@ -255,7 +255,15 @@ fn sdf_sample(s: Shape, p: vec2<f32>) -> DistanceSample {
             let normal = v / max(length(v), 1e-12);
             return DistanceSample(d, vec4<f32>(sgn * normal, rx, 0.0));
         }
-        let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
+        // Coverage replay knows the common ellipse exponent exactly. Give
+        // compilation a constant argument without changing the solver's
+        // projections, clamps, normal, or curvature calculation.
+        var l: vec4<f32>;
+        if specialize_quadratic && s.exponent == 2.0 {
+            l = lame_corner(q, vec2<f32>(rx, ry), 2.0);
+        } else {
+            l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
+        }
         return DistanceSample(l.x, vec4<f32>(sgn * l.yz, l.w, 0.0));
     }
     let g = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y);
@@ -417,8 +425,8 @@ fn corner_coverage(a: vec2<f32>, v1: vec2<f32>, v2: vec2<f32>, scale: f32) -> f3
 }
 
 // Coverage of the shape `s` at local point `p`, `m` mapping local to device.
-fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
-    let sample = sdf_sample(s, p);
+fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>, specialize_quadratic: bool) -> f32 {
+    let sample = sdf_sample(s, p, specialize_quadratic);
     let g = sample.gradient;
     // A sharp corner inside this pixel: the exact area inside both
     // half-planes. `a`, `sgn`, and the quadrant radius mirror `sdf_sample`;
@@ -464,7 +472,7 @@ fn clip_mask_coverage(in: VsOut) -> f32 {
     if (flags & FLAG_HAS_CLIP) != 0u {
         // `clip_inv` maps device to clip-local: J^-T is its transpose.
         let pc = apply(instances[i].clip_inv, in.pixel);
-        let sample = sdf_sample(instances[i].clip, pc);
+        let sample = sdf_sample(instances[i].clip, pc, false);
         let g = sample.gradient;
         let ci = instances[i].clip_inv;
         let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);

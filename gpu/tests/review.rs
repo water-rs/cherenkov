@@ -325,6 +325,16 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
     let font = engine.font(font())?;
     let font_id = font.id();
     let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
+    let solid = |surface: &cherenkov::Surface<Gpu>| {
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), WorkingColor::WHITE);
+            }));
+        });
+    };
+    solid(&surface);
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let without_glyphs = wait!(engine.memory()).cpu;
     let runs = text_runs(font_id, 8, 24.0);
     let text = |surface: &cherenkov::Surface<Gpu>| {
         surface.update(|tx| {
@@ -335,22 +345,18 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
     };
     text(&surface);
     wait!(engine.render(cherenkov::FrameTime::now()))?;
-    assert!(wait!(engine.memory()).cpu > Bytes(0), "glyph cells cached");
+    assert!(wait!(engine.memory()).cpu > without_glyphs, "glyph cells cached");
     drop(font);
     // Dirty the surface so the next frame re-lowers and consults the font.
     surface.clear_color(WorkingColor::new([0.0, 0.0, 0.0, 1.0]));
     wait!(engine.render(cherenkov::FrameTime::now()))?;
     assert!(
-        wait!(engine.memory()).cpu > Bytes(0),
+        wait!(engine.memory()).cpu > without_glyphs,
         "the installed content still draws the font"
     );
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| {
-            c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), WorkingColor::WHITE);
-        }));
-    });
+    solid(&surface);
     wait!(engine.render(cherenkov::FrameTime::now()))?;
-    assert_eq!(wait!(engine.memory()).cpu, Bytes(0), "font cells released");
+    assert_eq!(wait!(engine.memory()).cpu, without_glyphs, "font cells released");
     text(&surface);
     assert!(
         matches!(
@@ -486,7 +492,7 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
 }
 
 split_test! {
-/// `Pressure::Moderate` evicts scratch/backdrop textures; `Critical`
+/// `Pressure::Moderate` evicts scratch/backdrop textures and cached plans; `Critical`
 /// additionally returns the grow-only shared buffers to baseline —
 /// `Engine::memory` shows the drop.
 fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
@@ -494,7 +500,7 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
-    // Isolated group: forces a scratch pass and grows the instance buffer.
+    // Isolated group: needs a composition plan and grows the instance buffer.
     let scene = |c: &mut cherenkov::Recorder| {
         c.fill(
             Rect::new(0.0, 0.0, 64.0, 64.0),
@@ -517,10 +523,10 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     engine.trim(cherenkov::Pressure::Moderate);
     let moderate = wait!(engine.memory());
     assert!(
-        moderate.gpu.0 < before.gpu.0,
-        "Moderate evicts scratch/backdrop textures: {} → {}",
-        before.gpu.0,
-        moderate.gpu.0
+        moderate.gpu.0 + moderate.cpu.0 < before.gpu.0 + before.cpu.0,
+        "Moderate evicts temporary textures and plans: {} → {}",
+        before.gpu.0 + before.cpu.0,
+        moderate.gpu.0 + moderate.cpu.0
     );
     // Re-render so the instance buffer grows back, then trim hard.
     surface.update(|tx| {

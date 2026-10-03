@@ -80,8 +80,8 @@ fn an_overlapping_opacity_layer_still_isolates() -> Result<(), Box<dyn std::erro
     wait!(engine.render(cherenkov::FrameTime::now()))?;
     let stats = engine.stats();
     assert_eq!(
-        stats.passes, 3,
-        "overlapping rects must isolate (surface, scratch, surface)"
+        stats.passes, if cfg!(target_vendor = "apple") { 2 } else { 3 },
+        "overlapping rects isolate in a fused tile epoch on Metal"
     );
     let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
@@ -109,7 +109,7 @@ fn an_overlapping_opacity_layer_still_isolates() -> Result<(), Box<dyn std::erro
 }
 
 split_test! {
-fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error::Error>> {
+fn isolation_uses_tile_storage_or_a_region_sized_scratch() -> Result<(), Box<dyn std::error::Error>> {
     let config = GpuConfig {
         timestamps: true,
         ..GpuConfig::default()
@@ -135,7 +135,7 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
     });
     wait!(engine.render(cherenkov::FrameTime::now()))?;
     let stats = engine.stats();
-    assert_eq!(stats.passes, 3);
+    assert_eq!(stats.passes, if cfg!(target_vendor = "apple") { 2 } else { 3 });
     let phases = stats.phases;
     assert!(phases.lower_seconds >= 0.0 && phases.stamp_seconds >= 0.0);
     assert!(
@@ -145,6 +145,11 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
     // Per-pass regions come with the frame's timing; an adapter without
     // TIMESTAMP_QUERY reports none, and only the pixels are checked.
     if let Some(timing) = wait!(engine.finish_timings())?.pop() {
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(timing.passes.len(), 2);
+            assert_eq!(timing.passes[1].name, "tile composition");
+            assert_eq!((timing.passes[1].width, timing.passes[1].height), (256, 256));
+        } else {
         let scratch = timing
             .passes
             .iter()
@@ -162,6 +167,7 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
             scratch.width,
             scratch.height
         );
+        }
     }
     let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];

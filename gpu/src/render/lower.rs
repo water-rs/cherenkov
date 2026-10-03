@@ -4169,6 +4169,7 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
 /// premultiplied pixels are stored in.
 pub const fn globals(size: [f32; 2], origin: [f32; 2], space: cherenkov::BlendSpace) -> Globals {
     Globals {
+        attachment_origin: origin,
         size,
         origin,
         space: match space {

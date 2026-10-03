@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use cherenkov::{Engine, FrameTime, Offscreen, OffscreenFormat};
 use cherenkov_gpu::interop::{
-    ChromaOffset, ExternalFrame, FrameColor, GpuContent, GpuContentBox, Primaries, SharedDevice,
-    Transfer, YuvMatrix, YuvRange, wgpu,
+    ExternalFrame, FrameColor, GpuContent, GpuContentBox, SharedDevice, Transfer, YuvFrameParams,
+    YuvLayout, wgpu, yuv_frame_params,
 };
 use cherenkov_gpu::{Gpu, GpuConfig};
 
@@ -100,220 +100,15 @@ impl Spec {
     }
 }
 
-/// The shader-visible decode arguments — the same 192-byte layout as
-/// `cherenkov-gpu`'s `render::external::Params`, which `external.wgsl`
-/// declares as `ExtParams`. Baked here with the same math; the engine's
-/// copy lives in `gpu/src/render/external/mod.rs::params`.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Params {
-    info: [u32; 4],
-    dims: [f32; 4],
-    norm: [f32; 4],
-    site: [f32; 4],
-    yuv: [[f32; 4]; 4],
-    prim: [[f32; 4]; 3],
-    luma: [f32; 4],
-}
-
-const KIND_NV12: u32 = 1;
-const KIND_P010: u32 = 2;
-const FLAG_SHIFT6: u32 = 2;
-
-/// The `s` in "chroma texel `i` centres on luma position `2i + s`".
-const fn siting(offset: ChromaOffset) -> f32 {
-    match offset {
-        ChromaOffset::Cosited => 0.0,
-        ChromaOffset::Centered => 0.5,
-    }
-}
-
-/// `Kr, Kb` of a `Y'CbCr` matrix — mirrors `external/mod.rs::matrix_coeffs`.
-const fn matrix_coeffs(matrix: YuvMatrix) -> (f32, f32) {
-    match matrix {
-        YuvMatrix::Bt601 => (0.299, 0.114),
-        YuvMatrix::Bt709 => (0.2126, 0.0722),
-        YuvMatrix::Bt2020 => (0.2627, 0.0593),
-    }
-}
-
-/// xy chromaticities `(red, green, blue)` of a primaries set; all D65 —
-/// mirrors `external/mod.rs::primaries_xy`.
-const fn primaries_xy(primaries: Primaries) -> [[f32; 2]; 3] {
-    match primaries {
-        Primaries::Bt709 => [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
-        Primaries::DisplayP3 => [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]],
-        Primaries::Bt2020 => [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]],
-    }
-}
-
-/// xy → XYZ at unit luminance.
-fn to_xyz(xy: [f32; 2]) -> [f32; 3] {
-    let [x, y] = xy;
-    [x / y, 1.0, (1.0 - x - y) / y]
-}
-
-/// `M · v` for a row-major 3×3.
-fn mat_mul(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
-    [
-        m[0][2].mul_add(v[2], m[0][1].mul_add(v[1], m[0][0] * v[0])),
-        m[1][2].mul_add(v[2], m[1][1].mul_add(v[1], m[1][0] * v[0])),
-        m[2][2].mul_add(v[2], m[2][1].mul_add(v[1], m[2][0] * v[0])),
-    ]
-}
-
-fn mat_invert(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let det = m[0][2].mul_add(
-        m[1][0].mul_add(m[2][1], -(m[1][1] * m[2][0])),
-        (-m[0][1]).mul_add(
-            m[1][0].mul_add(m[2][2], -(m[1][2] * m[2][0])),
-            m[0][0] * m[1][1].mul_add(m[2][2], -(m[1][2] * m[2][1])),
-        ),
-    );
-    let inv = 1.0 / det;
-    [
-        [
-            m[1][1].mul_add(m[2][2], -(m[1][2] * m[2][1])) * inv,
-            m[0][2].mul_add(m[2][1], -(m[0][1] * m[2][2])) * inv,
-            m[0][1].mul_add(m[1][2], -(m[0][2] * m[1][1])) * inv,
-        ],
-        [
-            m[1][2].mul_add(m[2][0], -(m[1][0] * m[2][2])) * inv,
-            m[0][0].mul_add(m[2][2], -(m[0][2] * m[2][0])) * inv,
-            m[0][2].mul_add(m[1][0], -(m[0][0] * m[1][2])) * inv,
-        ],
-        [
-            m[1][0].mul_add(m[2][1], -(m[1][1] * m[2][0])) * inv,
-            m[0][1].mul_add(m[2][0], -(m[0][0] * m[2][1])) * inv,
-            m[0][0].mul_add(m[1][1], -(m[0][1] * m[1][0])) * inv,
-        ],
-    ]
-}
-
-fn mat_product(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut out = [[0.0; 3]; 3];
-    for (r, row) in a.iter().enumerate() {
-        for (c, out_c) in out[r].iter_mut().enumerate() {
-            *out_c = row[2].mul_add(b[2][c], row[1].mul_add(b[1][c], row[0] * b[0][c]));
-        }
-    }
-    out
-}
-
-/// RGB → XYZ of a primaries set, normalized to D65 white.
-fn rgb_to_xyz(primaries: Primaries) -> [[f32; 3]; 3] {
-    let [red, green, blue] = primaries_xy(primaries);
-    let cols = [to_xyz(red), to_xyz(green), to_xyz(blue)];
-    let unscaled = [
-        [cols[0][0], cols[1][0], cols[2][0]],
-        [cols[0][1], cols[1][1], cols[2][1]],
-        [cols[0][2], cols[1][2], cols[2][2]],
-    ];
-    let d65 = to_xyz([0.3127, 0.3290]);
-    let scales = mat_mul(mat_invert(unscaled), d65);
-    let mut out = [[0.0; 3]; 3];
-    for (c, col) in cols.iter().enumerate() {
-        for (r, out_r) in out.iter_mut().enumerate() {
-            out_r[c] = col[r] * scales[c];
-        }
-    }
-    out
-}
-
-/// The absolute-to-white-relative scale of a transfer; mirrors
-/// `external/mod.rs::value_scale`.
-fn value_scale(color: &FrameColor) -> f32 {
-    match color.transfer {
-        Transfer::Pq => 10_000.0 / color.reference_white,
-        Transfer::Hlg => color.hlg_peak / color.reference_white,
-        _ => 1.0,
-    }
-}
-
-/// Code normalization `code * scale + offset` — mirrors
-/// `external/mod.rs::code_norm`.
-const fn code_norm(range: YuvRange, bits: u32) -> [f32; 4] {
-    match (range, bits) {
-        (YuvRange::Video, 8) => [1.0 / 219.0, -16.0 / 219.0, 1.0 / 224.0, -128.0 / 224.0],
-        (YuvRange::Full, 8) => [1.0 / 255.0, 0.0, 1.0 / 255.0, -128.0 / 255.0],
-        (YuvRange::Video, _) => [1.0 / 876.0, -64.0 / 876.0, 1.0 / 896.0, -512.0 / 896.0],
-        (YuvRange::Full, _) => [1.0 / 1023.0, 0.0, 1.0 / 1023.0, -512.0 / 1023.0],
-    }
-}
-
-/// `R'G'B'` decode columns — mirrors `external/mod.rs::yuv_columns`.
-fn yuv_columns(matrix: YuvMatrix) -> [[f32; 4]; 4] {
-    let (kr, kb) = matrix_coeffs(matrix);
-    let kg = 1.0 - kr - kb;
-    [
-        [1.0, 1.0, 1.0, 0.0],
-        [0.0, -2.0 * kb * (1.0 - kb) / kg, 2.0 * (1.0 - kb), 0.0],
-        [2.0 * (1.0 - kr), -2.0 * kr * (1.0 - kr) / kg, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0],
-    ]
-}
-
-/// Bakes a spec's decode into the `ExtParams` uniform — the same bake
-/// `external/mod.rs::params` performs for an installed frame.
-#[expect(clippy::cast_precision_loss, reason = "texture dimensions fit f32")]
-fn params(spec: &Spec) -> Params {
-    let color = &spec.color;
-    let (kind, flags) = match spec.bits {
-        8 => (KIND_NV12, 0),
-        _ => (KIND_P010, FLAG_SHIFT6),
+/// The spec's decode uniform — [`yuv_frame_params`], the same bake the
+/// engine writes for an installed YUV frame.
+fn frame_params(spec: &Spec) -> YuvFrameParams {
+    let layout = if spec.bits == 8 {
+        YuvLayout::Nv12
+    } else {
+        YuvLayout::P010
     };
-    let scale = value_scale(color);
-    let to_xyz = rgb_to_xyz(color.primaries);
-    let to_p3 = mat_product(mat_invert(rgb_to_xyz(Primaries::DisplayP3)), to_xyz);
-    let prim = [
-        [
-            to_p3[0][0] * scale,
-            to_p3[1][0] * scale,
-            to_p3[2][0] * scale,
-            0.0,
-        ],
-        [
-            to_p3[0][1] * scale,
-            to_p3[1][1] * scale,
-            to_p3[2][1] * scale,
-            0.0,
-        ],
-        [
-            to_p3[0][2] * scale,
-            to_p3[1][2] * scale,
-            to_p3[2][2] * scale,
-            0.0,
-        ],
-    ];
-    let luma = [to_xyz[1][0], to_xyz[1][1], to_xyz[1][2], 0.0];
-    Params {
-        info: [
-            kind,
-            color.transfer as u32,
-            0, /* RgbAlpha::Opaque */
-            flags,
-        ],
-        dims: [
-            spec.width as f32,
-            spec.height as f32,
-            spec.width.div_ceil(2) as f32,
-            spec.height.div_ceil(2) as f32,
-        ],
-        norm: code_norm(color.range, spec.bits),
-        site: [
-            siting(color.chroma_siting.x),
-            siting(color.chroma_siting.y),
-            if color.transfer == Transfer::Hlg {
-                0.42f32.mul_add((color.hlg_peak / 1000.0).log10(), 1.2)
-            } else {
-                0.0
-            },
-            0.0,
-        ],
-        yuv: yuv_columns(color.matrix),
-        prim,
-        luma,
-    }
+    yuv_frame_params(&spec.color, layout, (spec.width, spec.height))
 }
 
 /// The synthetic frame pattern: a luma ramp and an interleaved chroma
@@ -447,9 +242,10 @@ impl GpuContent for Convert {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                std::mem::size_of::<Params>() as u64
-                            ),
+                            min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                                YuvFrameParams,
+                            >()
+                                as u64),
                         },
                         count: None,
                     },
@@ -938,13 +734,13 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             let copy = CopyPath::new(&shared, &spec, 3 * total);
             let params_buffer = shared.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("external-cost convert params"),
-                size: std::mem::size_of::<Params>() as u64,
+                size: std::mem::size_of::<YuvFrameParams>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             shared
                 .queue
-                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params(&spec)));
+                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&frame_params(&spec)));
             let content = Convert {
                 y: copy.y.create_view(&wgpu::TextureViewDescriptor::default()),
                 uv: copy.uv.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -1192,13 +988,13 @@ pub fn composite_frame(
             let copy = CopyPath::new(&shared, &spec, 3);
             let params_buffer = shared.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("external-cost convert params"),
-                size: std::mem::size_of::<Params>() as u64,
+                size: std::mem::size_of::<YuvFrameParams>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             shared
                 .queue
-                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params(&spec)));
+                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&frame_params(&spec)));
             let content = Convert {
                 y: copy.y.create_view(&wgpu::TextureViewDescriptor::default()),
                 uv: copy.uv.create_view(&wgpu::TextureViewDescriptor::default()),

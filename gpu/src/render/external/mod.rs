@@ -276,11 +276,63 @@ fn primaries_params(color: &crate::interop::FrameColor) -> ([[f32; 4]; 3], [f32;
     (prim, [to_xyz[1][0], to_xyz[1][1], to_xyz[1][2], 0.0])
 }
 
-/// Bakes an `ExternalFrame`'s decode into its shader arguments.
+/// Biplanar 4:2:0 packing of a frame [`yuv_frame_params`] bakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YuvLayout {
+    /// 8-bit NV12: luma `R8Uint`, interleaved chroma `Rg8Uint`.
+    Nv12,
+    /// 10-bit P010 stored in the high bits of 16-bit words.
+    P010,
+}
+
+/// Bakes the 192-byte `ExtParams` uniform `external.wgsl` reads.
+///
+/// `color` is the frame's decode, `layout` its plane packing and `size`
+/// the luma plane in pixels. Chroma is half the luma on each axis
+/// (rounded up) and the frame is opaque: that is the whole input the
+/// uniform needs. The engine's retained YUV path and a host that runs
+/// the same `ext_frame_yuv` decode both call this, so the uniform
+/// cannot drift.
+#[must_use]
+pub fn yuv_frame_params(
+    color: &crate::interop::FrameColor,
+    layout: YuvLayout,
+    size: (u32, u32),
+) -> Params {
+    let (kind, flags) = match layout {
+        YuvLayout::Nv12 => (KIND_NV12, 0),
+        YuvLayout::P010 => (KIND_P010, FLAG_SHIFT6),
+    };
+    let (width, height) = size;
+    bake(
+        color,
+        kind,
+        0,
+        flags,
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        wgpu::Extent3d {
+            width: width.div_ceil(2),
+            height: height.div_ceil(2),
+            depth_or_array_layers: 1,
+        },
+    )
+}
+
+/// The colour math and plane contract of one uniform, shared by
+/// [`yuv_frame_params`] and the RGB / external-format cases.
 #[expect(clippy::cast_precision_loss, reason = "texture dimensions fit f32")]
-pub fn params(frame: &ExternalFrame) -> Params {
-    let color = &frame.color;
-    let (kind, alpha, flags, plane_size, chroma_size) = plane_contract(frame);
+fn bake(
+    color: &crate::interop::FrameColor,
+    kind: u32,
+    alpha: u32,
+    flags: u32,
+    plane_size: wgpu::Extent3d,
+    chroma_size: wgpu::Extent3d,
+) -> Params {
     let (prim, luma) = primaries_params(color);
     Params {
         info: [kind, color.transfer as u32, alpha, flags],
@@ -305,6 +357,24 @@ pub fn params(frame: &ExternalFrame) -> Params {
         prim,
         luma,
     }
+}
+
+/// Bakes an `ExternalFrame`'s decode into its shader arguments.
+///
+/// YUV planes — ordinary or a native multiplanar import — go through
+/// [`yuv_frame_params`]. RGB and external-format imports bake here with
+/// their own kind and alpha.
+pub fn params(frame: &ExternalFrame) -> Params {
+    let (kind, alpha, flags, plane_size, chroma_size) = plane_contract(frame);
+    if kind == KIND_NV12 || kind == KIND_P010 {
+        let layout = if kind == KIND_NV12 {
+            YuvLayout::Nv12
+        } else {
+            YuvLayout::P010
+        };
+        return yuv_frame_params(&frame.color, layout, (plane_size.width, plane_size.height));
+    }
+    bake(&frame.color, kind, alpha, flags, plane_size, chroma_size)
 }
 
 /// The clip-mask part of an external draw's bind.

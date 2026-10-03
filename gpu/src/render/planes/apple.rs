@@ -421,7 +421,7 @@ impl MotionState {
         self.tracks.iter().any(|track| track.layer == layer)
     }
 
-    fn placed(&mut self, tree_changed: bool) {
+    const fn placed(&mut self, tree_changed: bool) {
         self.tree_changed |= tree_changed;
     }
 

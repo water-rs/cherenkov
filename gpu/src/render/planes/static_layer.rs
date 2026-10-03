@@ -84,7 +84,7 @@ impl Observation {
         self.quiet_required = if self.quiet_frames > self.quiet_required.saturating_mul(2) {
             2
         } else {
-            self.quiet_frames.saturating_add(1).max(2).min(QUIET_LIMIT)
+            self.quiet_frames.saturating_add(1).clamp(2, QUIET_LIMIT)
         };
         self.stamp = stamp;
         self.resources = resources;
@@ -397,7 +397,7 @@ mod tests {
                 super::domain(
                     &ops,
                     picture.display_list(),
-                    &Default::default(),
+                    &rustc_hash::FxHashMap::default(),
                     density,
                     4096
                 )
@@ -409,7 +409,7 @@ mod tests {
         let domain = super::domain(
             &ops,
             picture.display_list(),
-            &Default::default(),
+            &rustc_hash::FxHashMap::default(),
             1.25,
             4096,
         )

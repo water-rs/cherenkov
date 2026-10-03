@@ -241,6 +241,8 @@ pub struct Globals {
     pub space: u32,
     /// Padding to the uniform alignment.
     pub pad: u32,
+    /// Device-space origin of the physical attachment grid.
+    pub attachment_origin: [f32; 2],
 }
 
 /// Converts a kurbo affine into the shader's `[a, b, c, d, e, f, 0, 0]`.
@@ -263,6 +265,10 @@ mod tests {
         assert_eq!(size_of::<Instance>(), 272);
         assert_eq!(size_of::<Shape>(), 32);
         assert_eq!(size_of::<Stop>(), 32);
-        assert_eq!(size_of::<Globals>(), 24);
+        assert_eq!(size_of::<Globals>(), 32);
+        assert_eq!(
+            super::super::bindings::ENGINE_GROUP0[0].min_size,
+            size_of::<Globals>() as u64
+        );
     }
 }

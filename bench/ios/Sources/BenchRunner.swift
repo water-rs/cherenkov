@@ -4,10 +4,13 @@ import OSLog
 private let logger = Logger(subsystem: "dev.cherenkov", category: "bench")
 
 /// One finished run: its arguments and exit code, as recorded in
-/// `done.json`.
+/// `done.json`, with the device thermal state bracketing the run
+/// (`ProcessInfo.thermalState`: 0 nominal, 1 fair, 2 serious, 3 critical).
 struct BenchRunResult {
     let args: [String]
     let exitCode: Int32
+    let thermalBefore: Int
+    let thermalAfter: Int
 }
 
 /// Receives bench progress on the main thread.
@@ -51,6 +54,9 @@ struct BenchRunner {
 
     /// The overall exit code: the first non-zero run's, else 0.
     func runAll() -> Int32 {
+        // Identifies this launch's out/ so a driver can tell a done.json
+        // left by a previous launch from this one's.
+        let runId = UUID().uuidString
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         // Outside `out`: the reset below deletes `out`, and the driver
         // reads this before the measurement exists.
@@ -111,13 +117,27 @@ struct BenchRunner {
             logger.info("run \(index): \(args.joined(separator: " "), privacy: .public)")
             report { $0.benchRunner(self, didStartRun: index, of: argLists.count, args: args) }
             let logURL = outDir.appendingPathComponent("run-\(index).log")
+            let thermalBefore = ProcessInfo.processInfo.thermalState.rawValue
             let code = Self.invoke(args, logTo: logURL)
-            logger.info("run \(index): exit \(code)")
-            results.append(BenchRunResult(args: args, exitCode: code))
+            let thermalAfter = ProcessInfo.processInfo.thermalState.rawValue
+            logger.info("run \(index): exit \(code), thermal \(thermalBefore)->\(thermalAfter)")
+            results.append(BenchRunResult(
+                args: args,
+                exitCode: code,
+                thermalBefore: thermalBefore,
+                thermalAfter: thermalAfter
+            ))
             if firstFailure == 0 { firstFailure = code }
         }
-        let doneResults = results.map { ["args": $0.args, "exit_code": $0.exitCode] as [String: Any] }
-        guard Self.writeDone(["results": doneResults], to: outDir) else {
+        let doneResults = results.map {
+            [
+                "args": $0.args,
+                "exit_code": $0.exitCode,
+                "thermal_before": $0.thermalBefore,
+                "thermal_after": $0.thermalAfter,
+            ] as [String: Any]
+        }
+        guard Self.writeDone(["run_id": runId, "results": doneResults], to: outDir) else {
             report { $0.benchRunner(self, didFailWithError: "cannot write done.json") }
             return 1
         }

@@ -27,6 +27,9 @@
 #[path = "src/render/bindings.rs"]
 mod bindings;
 
+#[path = "build_tile.rs"]
+mod tile;
+
 use std::env;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -167,6 +170,10 @@ fn main() {
         merge_pair: None,
     });
 
+    compile_specs(&out_dir, &specs);
+}
+
+fn compile_specs(out_dir: &Path, specs: &[Spec]) {
     // wasm builds embed no passthrough artifacts, and Apple builds embed
     // no `.spv` (issue #241), so `xcrun` is required only on the targets
     // that consume its artifacts; the WGSL is still parsed and validated
@@ -180,8 +187,26 @@ fn main() {
     if spirv {
         println!("cargo::rustc-cfg=cherenkov_spirv");
     }
-    for spec in &specs {
-        compile(&out_dir, spec, apple.as_ref(), wasm, spirv);
+    for spec in specs {
+        compile(out_dir, spec, apple.as_ref(), wasm, spirv);
+    }
+    if let Some(apple) = apple.as_ref() {
+        let spec = Spec {
+            name: "engine_tile".into(),
+            source: specs[2].source.clone(),
+            groups: bindings::ENGINE_GROUPS,
+            metal: true,
+            merge_pair: None,
+        };
+        compile(out_dir, &spec, Some(apple), false, false);
+        let fixture = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("tests/shaders/attachment_read.metal");
+        std::io::Write::write_fmt(
+            &mut std::io::stdout(),
+            format_args!("cargo::rerun-if-changed={}\n", fixture.display()),
+        )
+        .unwrap();
+        compile_metal(out_dir, "attachment_read", &fixture, apple, (3, 0));
     }
 }
 
@@ -202,13 +227,16 @@ fn emits_spirv() -> bool {
 
 /// Parses, validates and compiles one module.
 fn compile(out_dir: &Path, spec: &Spec, apple: Option<&AppleTarget>, wasm: bool, spirv: bool) {
-    let module = naga::front::wgsl::parse_str(&spec.source).unwrap_or_else(|e| {
+    let mut module = naga::front::wgsl::parse_str(&spec.source).unwrap_or_else(|e| {
         panic!(
             "{}: WGSL parse failed:\n{}",
             spec.name,
             e.emit_to_string(&spec.source)
         )
     });
+    if spec.name == "engine_tile" {
+        tile::attachment_inputs(&mut module);
+    }
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)
         .unwrap_or_else(|e| panic!("{}: WGSL validation failed: {e:?}", spec.name));
@@ -621,7 +649,11 @@ fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, apple: Option
     let options = msl::Options {
         // The floor Metal language version wgpu selects on supported
         // hardware; the shader test covers the same value.
-        lang_version: (2, 0),
+        lang_version: if spec.name == "engine_tile" {
+            (3, 0)
+        } else {
+            (2, 0)
+        },
         per_entry_point_map: resource_map(spec, &module),
         inline_samplers: Vec::new(),
         spirv_cross_compatibility: false,
@@ -669,45 +701,56 @@ fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, apple: Option
     std::fs::write(&metal, &source).unwrap();
 
     if let Some(apple) = apple {
-        let sdk = apple.sdk;
-        let air = out_dir.join(format!("{}.air", spec.name));
-        let metallib = out_dir.join(format!("{}.metallib", spec.name));
-        // Metal 3 unified the platform-specific language dialects.
-        let dialect = if options.lang_version >= (3, 0) {
-            "metal"
-        } else if sdk == "macosx" {
-            "macos-metal"
+        let input = if spec.name == "engine_tile" {
+            let scaffold = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("src/render/composite/attachment.metal");
+            println!("cargo::rerun-if-changed={}", scaffold.display());
+            scaffold
         } else {
-            "ios-metal"
+            metal
         };
-        run(
-            Command::new("xcrun")
-                .env(apple.deployment_variable, &apple.deployment_version)
-                .args(["-sdk", sdk, "metal", "-c", "-o"])
-                .arg(&air)
-                // Match the language naga emitted instead of inheriting
-                // the build SDK's newest version, which older supported
-                // operating systems cannot load.
-                .arg(format!(
-                    "-std={dialect}{}.{}",
-                    options.lang_version.0, options.lang_version.1
-                ))
-                .arg(&metal),
-            &spec.name,
-            "xcrun metal is required to build cherenkov-gpu for Apple \
-             targets: engine shaders are precompiled (issue #57).",
-        );
-        run(
-            Command::new("xcrun")
-                .env(apple.deployment_variable, &apple.deployment_version)
-                .args(["-sdk", sdk, "metallib", "-o"])
-                .arg(&metallib)
-                .arg(&air),
-            &spec.name,
-            "xcrun metallib is required to build cherenkov-gpu for Apple \
-             targets: engine shaders are precompiled (issue #57).",
-        );
+        compile_metal(out_dir, &spec.name, &input, apple, options.lang_version);
     }
+}
+
+fn compile_metal(out_dir: &Path, name: &str, input: &Path, apple: &AppleTarget, version: (u8, u8)) {
+    let sdk = apple.sdk;
+    let air = out_dir.join(format!("{name}.air"));
+    let metallib = out_dir.join(format!("{name}.metallib"));
+    // Metal 3 unified the platform-specific language dialects.
+    let dialect = if version >= (3, 0) {
+        "metal"
+    } else if sdk == "macosx" {
+        "macos-metal"
+    } else {
+        "ios-metal"
+    };
+    run(
+        Command::new("xcrun")
+            .env(apple.deployment_variable, &apple.deployment_version)
+            .args(["-sdk", sdk, "metal", "-c", "-o"])
+            .arg(&air)
+            // Match the language naga emitted instead of inheriting
+            // the build SDK's newest version, which older supported
+            // operating systems cannot load.
+            .arg(format!("-std={dialect}{}.{}", version.0, version.1))
+            .arg("-I")
+            .arg(out_dir)
+            .arg(input),
+        name,
+        "xcrun metal is required to build cherenkov-gpu for Apple \
+             targets: engine shaders are precompiled (issue #57).",
+    );
+    run(
+        Command::new("xcrun")
+            .env(apple.deployment_variable, &apple.deployment_version)
+            .args(["-sdk", sdk, "metallib", "-o"])
+            .arg(&metallib)
+            .arg(&air),
+        name,
+        "xcrun metallib is required to build cherenkov-gpu for Apple \
+             targets: engine shaders are precompiled (issue #57).",
+    );
 }
 
 /// Pins each runtime-sized `array<T>` to `array<T, 1>` in a cloned module.

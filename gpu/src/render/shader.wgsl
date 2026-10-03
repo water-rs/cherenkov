@@ -499,6 +499,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return fs_full(in);
 }
 
+// The tile build profile replaces these two interfaces with attachment
+// inputs. Coverage, colour conversion and blend arithmetic remain shared.
+fn read_composite_source(coord: vec2<i32>) -> vec4<f32> {
+    return textureLoad(source, coord, 0);
+}
+
+fn read_composite_backdrop(coord: vec2<i32>) -> vec4<f32> {
+    return textureLoad(backdrop, coord, 0);
+}
+
 // Solid fill/span/glyph coverage: no clip, mask, inner, or paint()
 // evaluation, and no `instances` reads at all.
 fn fs_simple(in: VsOut, classified: bool) -> vec4<f32> {
@@ -704,16 +714,16 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         let tspace = select(SPACE_LINEAR, SPACE_SRGB, (flags & FLAG_TEX_SRGB) != 0u);
         let coord = vec2<i32>(floor(in.device - instances[i].grad.xy));
         if mode == 0u && (flags & FLAG_BLEND_SRC) == 0u {
-            return move_space(textureLoad(source, coord, 0), tspace, globals.space) * cov;
+            return move_space(read_composite_source(coord), tspace, globals.space) * cov;
         }
-        let cb = textureLoad(backdrop, coord, 0);
+        let cb = read_composite_backdrop(coord);
         if blend_is_destructive(mode) {
             // Destructive operators composite over the whole region: a
             // transparent source still writes over the backdrop.
-            let cs = textureLoad(source, coord, 0) * in.params.y;
+            let cs = read_composite_source(coord) * in.params.y;
             return mix(cb, composite_space(mode, tspace, cb, cs), inside_cov);
         }
-        let cs = textureLoad(source, coord, 0) * cov;
+        let cs = read_composite_source(coord) * cov;
         return composite_space(mode, tspace, cb, cs);
     }
     if in.meta_.y == PAINT_BACKDROP {

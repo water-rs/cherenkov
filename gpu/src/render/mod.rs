@@ -5022,15 +5022,31 @@ impl GpuRenderer {
             let Some(content) = surf.layers.get(&layer) else {
                 continue;
             };
-            let Some((ops, source)) = content.retained.current() else {
-                surf.static_layers.remove(&layer);
-                continue;
-            };
             let stamp = sf.tree.content_stamp(layer);
             // The transformed unit circle's major radius is the largest
             // singular value. Capture at the actual device density.
             let radii = kurbo::Ellipse::from_affine(space).radii();
             let density = radii.x.max(radii.y);
+            // A replacement is unprepared until this frame lowers it. The
+            // lifetime still has to be recorded: deleting the observation
+            // admits the following interval from the initial threshold.
+            let Some((ops, source)) = content.retained.current() else {
+                let forget = if let Some(entry) = surf.static_layers.get_mut(&layer) {
+                    if entry.stamp != stamp || entry.resources != resources {
+                        entry.change(stamp, resources);
+                        entry.density = density;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
+                if forget {
+                    surf.static_layers.remove(&layer);
+                }
+                continue;
+            };
             let entry = surf
                 .static_layers
                 .entry(layer)

@@ -1386,6 +1386,7 @@ impl SystemPlanes for LayerPlanes {
                     *generation,
                     c.display.headroom,
                 )?;
+                buffer.completing(c.queue, self.waker.clone());
                 c.presenter.texture(
                     c.device,
                     c.queue,
@@ -1397,7 +1398,6 @@ impl SystemPlanes for LayerPlanes {
                         headroom: c.display.headroom,
                     },
                 );
-                buffer.completed(c.queue, self.waker.clone())?;
                 self.buffers.insert(layer, buffer);
             }
             let buffer = &self.buffers[&layer];

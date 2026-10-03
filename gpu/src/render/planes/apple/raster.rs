@@ -1,7 +1,7 @@
 //! Immutable, colour-tagged `IOSurface`s for recorded layer pixels.
 
 use cherenkov::RenderError;
-use objc2::rc::autoreleasepool;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_foundation::{CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_video::{
@@ -11,10 +11,11 @@ use objc2_core_video::{
 };
 use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandQueue, MTLDevice, MTLPixelFormat, MTLTextureDescriptor,
+    MTLDevice, MTLPixelFormat, MTLSharedEvent, MTLSharedEventListener, MTLTextureDescriptor,
     MTLTextureType, MTLTextureUsage,
 };
 use objc2_quartz_core::CALayer;
+use std::ptr::NonNull;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -26,6 +27,9 @@ pub(super) struct Buffer {
     pub generation: u64,
     pub ready: Arc<AtomicBool>,
     pub headroom: f32,
+    /// Signalled on the conversion command buffer. The listener waits for
+    /// value 1, which this buffer publishes once.
+    completion: Retained<ProtocolObject<dyn MTLSharedEvent>>,
 }
 
 impl Buffer {
@@ -96,6 +100,9 @@ impl Buffer {
             .raw_device()
             .newTextureWithDescriptor_iosurface_plane(&descriptor, &surface, 0)
             .ok_or_else(|| RenderError::Render("Metal refused a static plane IOSurface".into()))?;
+        let completion = metal.raw_device().newSharedEvent().ok_or_else(|| {
+            RenderError::Render("Metal refused a capture completion event".into())
+        })?;
         let extent = wgpu::Extent3d {
             width: size.0,
             height: size.1,
@@ -135,38 +142,42 @@ impl Buffer {
             generation,
             headroom,
             ready: Arc::new(AtomicBool::new(false)),
+            completion,
         })
     }
 
-    pub fn completed(
-        &self,
-        queue: &wgpu::Queue,
-        waker: cherenkov::CompletionWaker,
-    ) -> Result<(), RenderError> {
-        // wgpu completion callbacks require a subsequent submit or device
-        // poll. This surface can now be idle: a native queue completion
-        // must wake it without another engine frame. The empty command
-        // buffer follows the conversion on the very same Metal queue.
+    /// Wake `waker` when the next submission on `queue` finishes.
+    ///
+    /// The listener is registered before the signal is staged. wgpu encodes
+    /// that signal on the next submit's last command buffer, after the
+    /// submit's own completion, so the callback observes the conversion
+    /// committed with it. An empty marker committed beside that work can
+    /// run first.
+    pub fn completing(&self, queue: &wgpu::Queue, waker: cherenkov::CompletionWaker) {
         autoreleasepool(|_| {
-            // SAFETY: no resource or queue state is modified outside wgpu;
-            // the marker only observes completion of preceding submissions.
-            let metal = unsafe { queue.as_hal::<wgpu::hal::metal::Api>() }.expect("Metal queue");
-            let marker = metal.as_raw().commandBuffer().ok_or_else(|| {
-                RenderError::Render("Metal refused a capture completion marker".into())
-            })?;
             let ready = Arc::clone(&self.ready);
             let block = block2::RcBlock::new(
-                move |_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
                     ready.store(true, Ordering::Release);
                     waker.wake();
                 },
             );
-            // SAFETY: Metal retains the callback until completion. Its captured
-            // state is thread safe and it never accesses a native layer.
-            unsafe { marker.addCompletedHandler(block2::RcBlock::as_ptr(&block)) };
-            marker.commit();
-            Ok(())
-        })
+            // SAFETY: Metal copies the block and invokes it with the event
+            // and the signaled value. The flag and waker are thread safe,
+            // and the callback never touches a layer. `add_signal_event`
+            // only stages a signal for this queue's next submit.
+            unsafe {
+                self.completion.notifyListener_atValue_block(
+                    &MTLSharedEventListener::sharedListener(),
+                    1,
+                    block2::RcBlock::as_ptr(&block),
+                );
+                queue
+                    .as_hal::<wgpu::hal::metal::Api>()
+                    .expect("Metal queue")
+                    .add_signal_event(self.completion.clone(), 1);
+            }
+        });
     }
 
     pub fn bytes(&self) -> u64 {

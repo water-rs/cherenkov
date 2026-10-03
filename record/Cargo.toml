@@ -16,6 +16,7 @@ color = "0.3.3"
 kurbo = "0.13.1"
 nami-core = { version = "0.3.3", features = ["kurbo"] }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
+thiserror = "2"
 web-time = "1"
 
 [dev-dependencies]

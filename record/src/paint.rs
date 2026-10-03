@@ -559,11 +559,13 @@ struct MeshGradientData {
 }
 
 /// Why a mesh gradient's grid is malformed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MeshGradientError {
     /// Grid dimensions overflow addressable storage.
+    #[error("mesh grid exceeds addressable storage")]
     GridOverflow,
     /// The grid has no patch.
+    #[error("a mesh gradient needs at least one patch, got {columns} x {rows}")]
     Empty {
         /// Patches per row.
         columns: u32,
@@ -571,6 +573,7 @@ pub enum MeshGradientError {
         rows: u32,
     },
     /// A per-vertex list does not hold one entry per grid vertex.
+    #[error("a mesh gradient needs one {list} per grid vertex: {vertices} vertices, {len} entries")]
     VertexCount {
         /// Which list: points or colours.
         list: &'static str,
@@ -580,30 +583,6 @@ pub enum MeshGradientError {
         len: usize,
     },
 }
-
-impl std::fmt::Display for MeshGradientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::GridOverflow => write!(f, "mesh grid exceeds addressable storage"),
-            Self::Empty { columns, rows } => {
-                write!(
-                    f,
-                    "a mesh gradient needs at least one patch, got {columns} x {rows}"
-                )
-            }
-            Self::VertexCount {
-                list,
-                vertices,
-                len,
-            } => write!(
-                f,
-                "a mesh gradient needs one {list} per grid vertex: {vertices} vertices, {len} entries"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MeshGradientError {}
 
 impl TryFrom<MeshGradientData> for MeshGradient {
     type Error = MeshGradientError;

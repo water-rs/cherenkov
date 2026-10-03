@@ -283,19 +283,22 @@ struct DisplayListData {
 }
 
 /// Why a display list's scope structure is malformed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ScopeError {
     /// The list holds more commands than a `u32` index can address.
+    #[error("a display list holds at most u32::MAX commands, got {len}")]
     TooLong {
         /// Number of commands.
         len: usize,
     },
     /// An `End` closes no open scope.
+    #[error("command {index} ends a scope that was never opened")]
     UnmatchedEnd {
         /// Index of the `End`.
         index: usize,
     },
     /// A `Begin*` records the wrong index for its `End`.
+    #[error("the scope opened at {begin} records its end at {recorded}, but it ends at {actual}")]
     WrongEnd {
         /// Index of the `Begin*`.
         begin: usize,
@@ -305,40 +308,12 @@ pub enum ScopeError {
         actual: usize,
     },
     /// A scope is never closed.
+    #[error("the scope opened at {begin} is never closed")]
     Unclosed {
         /// Index of the `Begin*`.
         begin: usize,
     },
 }
-
-impl std::fmt::Display for ScopeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooLong { len } => {
-                write!(
-                    f,
-                    "a display list holds at most u32::MAX commands, got {len}"
-                )
-            }
-            Self::UnmatchedEnd { index } => {
-                write!(f, "command {index} ends a scope that was never opened")
-            }
-            Self::WrongEnd {
-                begin,
-                recorded,
-                actual,
-            } => write!(
-                f,
-                "the scope opened at {begin} records its end at {recorded}, but it ends at {actual}"
-            ),
-            Self::Unclosed { begin } => {
-                write!(f, "the scope opened at {begin} is never closed")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ScopeError {}
 
 #[cfg(feature = "serde")]
 impl TryFrom<DisplayListData> for DisplayList {

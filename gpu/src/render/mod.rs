@@ -27,7 +27,7 @@ mod upload;
 use cherenkov::Instant;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -786,8 +786,12 @@ pub struct GpuRenderer {
     frame_pass_count: u32,
     /// `(name, width, height, format)` of each encoded pass this frame.
     pass_meta: Vec<PassMeta>,
-    /// Bound on every GPU wait; see [`GpuConfig::wait_timeout`].
+    /// Window of every native GPU wait and the deadline of every browser
+    /// wait; see [`GpuConfig::wait_timeout`].
     wait_timeout: Duration,
+    /// The queue's retirement frontier; every native wait reads it between
+    /// windows to tell a slow queue (still retiring) from a wedged one.
+    tracker: Arc<SubmissionTracker>,
     max_texture: u32,
     /// The allocation-event diagnostic sink (issue #169); `None` in
     /// timed runs.
@@ -2113,6 +2117,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             frame_pass_count: 0,
             pass_meta: Vec::new(),
             wait_timeout: config.wait_timeout,
+            tracker: Arc::new(SubmissionTracker::default()),
             diag: config.alloc_diag.clone(),
             config,
             projective: None,
@@ -2416,6 +2421,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         frame_pass_count: 0,
         pass_meta: Vec::new(),
         wait_timeout: config.wait_timeout,
+        tracker: Arc::new(SubmissionTracker::default()),
         diag: config.alloc_diag.clone(),
         config,
         projective: None,
@@ -3325,7 +3331,7 @@ impl Renderer for GpuRenderer {
         // Tooling may wait; the frame path only polls. First complete draws
         // so their resolves can be encoded, then complete the resolve copies.
         if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
-            self.wait(last, "timestamp draws")?;
+            self.wait(&last, "timestamp draws")?;
         }
         self.drain_timestamps();
         if !self.pending_queries.is_empty() {
@@ -3337,7 +3343,7 @@ impl Renderer for GpuRenderer {
             for pending in &mut self.pending_timestamps {
                 pending.request_map();
             }
-            self.wait(last, "timestamp resolve")?;
+            self.wait(&last, "timestamp resolve")?;
             self.drain_timestamps();
         }
         if self.pending_timestamps.is_empty() {
@@ -3427,10 +3433,11 @@ impl Renderer for GpuRenderer {
             },
         );
         let submission = self.queue.submit([encoder.finish()]);
+        track_submission(&self.queue, &self.tracker);
         diag::submit(&self.device, &self.queue, "readback");
         tracing::trace!(?surface, ?submission, "readback submitted");
         let slice = buf.slice(..);
-        self.map_read(slice, submission, "the pixel readback")?;
+        self.map_read(slice, &submission, "the pixel readback")?;
         let data = slice
             .get_mapped_range()
             .expect("buffer range is mapped and not overlapping");
@@ -3516,6 +3523,7 @@ impl Renderer for GpuRenderer {
             },
         );
         let submission = self.queue.submit([encoder.finish()]);
+        track_submission(&self.queue, &self.tracker);
         diag::submit(&self.device, &self.queue, "readback");
         tracing::trace!(?surface, ?submission, "readback submitted");
         let slice = buf.slice(..);
@@ -3557,6 +3565,107 @@ impl Renderer for GpuRenderer {
             pixels,
         })
     }
+}
+
+/// The queue's retirement frontier as the engine sees it. Every
+/// `on_submitted_work_done` callback the engine registers retires one
+/// submission in flight order, so the count and the latest recorded
+/// submission describe what the GPU has provably finished — the progress
+/// signal every native wait reads between windows to tell a queue that is
+/// merely slow (still retiring) from one that is stuck.
+#[derive(Default)]
+struct SubmissionTracker {
+    retired_count: AtomicU64,
+}
+
+impl SubmissionTracker {
+    /// Records one retired submission. Runs inside
+    /// `on_submitted_work_done`, which the queue fires in submission order.
+    fn retire(&self) {
+        self.retired_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Submissions the queue has provably retired so far; only native
+    /// waits read the frontier.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn retired(&self) -> u64 {
+        self.retired_count.load(Ordering::Acquire)
+    }
+}
+
+/// One bounded window of a native GPU wait, repeated until completion or
+/// deadlock. The window is a deadline on GPU *progress*, not on the wait
+/// itself: a queue that retires any submission inside a window is still
+/// draining — the case of a slow adapter such as a CI runner's software
+/// rasterizer — so the wait warns once and opens another window; a whole
+/// window with zero retirements is a wedged queue and the wait fails as
+/// [`RenderError::Timeout`]. Any other poll error means the device is gone
+/// and surfaces as [`RenderError::DeviceLost`].
+///
+/// `poll` performs one `timeout`-bounded device wait; `completed` reads the
+/// retirement frontier. `awaited` appears only in diagnostics, so the
+/// decision is testable without a device.
+#[cfg(not(target_arch = "wasm32"))]
+fn wait_with_progress<I: std::fmt::Debug>(
+    what: &'static str,
+    timeout: Duration,
+    awaited: &I,
+    mut poll: impl FnMut() -> Result<wgpu::PollStatus, wgpu::PollError>,
+    mut completed: impl FnMut() -> u64,
+) -> Result<(), RenderError> {
+    let start = Instant::now();
+    let mut retired = completed();
+    loop {
+        match poll() {
+            Ok(status) => {
+                tracing::trace!(
+                    what,
+                    ?status,
+                    wait_ms = start.elapsed().as_secs_f64() * 1e3,
+                    "waited"
+                );
+                return Ok(());
+            }
+            Err(wgpu::PollError::Timeout) => {
+                let now = completed();
+                if now == retired {
+                    let elapsed = start.elapsed();
+                    tracing::error!(
+                        what,
+                        ?elapsed,
+                        ?awaited,
+                        "GPU wait timed out — no submission retired in the window"
+                    );
+                    return Err(RenderError::Timeout { what, timeout });
+                }
+                tracing::warn!(
+                    what,
+                    elapsed = ?start.elapsed(),
+                    ?awaited,
+                    retired_before = retired,
+                    retired_after = now,
+                    "GPU wait exceeds the warn window — still draining"
+                );
+                retired = now;
+            }
+            Err(e) => {
+                tracing::error!(what, %e, "GPU wait failed");
+                return Err(RenderError::DeviceLost);
+            }
+        }
+    }
+}
+
+/// Registers the retirement bump for `submission` — one callback per
+/// submission, fired in submission order, keeps `tracker`'s frontier
+/// honest. Called for every submission the engine makes; takes the queue
+/// and tracker by field so callers inside `&mut self` borrows elsewhere
+/// stay field-disjoint.
+fn track_submission(queue: &wgpu::Queue, tracker: &Arc<SubmissionTracker>) {
+    let tracker = Arc::clone(tracker);
+    queue.on_submitted_work_done(move || {
+        tracker.retire();
+    });
 }
 
 impl GpuRenderer {
@@ -6512,7 +6621,7 @@ impl GpuRenderer {
         self.grow_frame_buffers(&copies);
         if let upload::Acquire::Wait(submission) = self.uploads.acquire(&self.device, size)? {
             let start = Instant::now();
-            self.wait(submission, "upload staging")?;
+            self.wait(&submission, "upload staging")?;
             stats.phases.wait_seconds += start.elapsed().as_secs_f64();
             self.uploads.check_mapped()?;
         }
@@ -6634,18 +6743,27 @@ impl GpuRenderer {
                 label: Some("frame"),
             });
         // The frame's first submission carries every dirty surface's
-        // uploads ahead of its passes.
+        // uploads on its own encoder, queued ahead of the passes that
+        // consume them: the staging slot's map — and the wait the next
+        // acquire takes — then covers only the copy work itself, never
+        // this frame's rendering.
         let uploads = self.uploads.take_copies();
-        if let Some((staging, copies)) = &uploads {
-            for copy in copies {
+        let upload_buffer = uploads.map(|(staging, copies)| {
+            let mut upload_encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("upload staging"),
+                    });
+            for copy in &copies {
                 let dest = match copy.dest {
                     upload::Dest::Instances => &self.instances,
                     upload::Dest::Stops => &self.stops,
                     upload::Dest::Globals => &self.globals,
                 };
-                encoder.copy_buffer_to_buffer(staging, copy.src, dest, copy.dst, copy.size);
+                upload_encoder.copy_buffer_to_buffer(&staging, copy.src, dest, copy.dst, copy.size);
             }
-        }
+            upload_encoder.finish()
+        });
         // Group-1 bind groups persist across frames, keyed by
         // (source scratch, backdrop-needed, image, mask texture); the
         // stamp rebuilds them when a scratch/backdrop texture, the image
@@ -7630,6 +7748,16 @@ impl GpuRenderer {
         let submission = {
             #[cfg(all(unix, not(target_vendor = "apple")))]
             let _submit = self.submit_lock.lock().expect("submit guard");
+            // The staging copies precede every other submission this
+            // frame — including the external-frame semaphore pokes they
+            // must not consume — so the upload slot's map resolves as
+            // soon as the copies retire instead of after the passes.
+            let upload_submission = upload_buffer.map(|buffer| {
+                let submission = self.queue.submit([buffer]);
+                track_submission(&self.queue, &self.tracker);
+                diag::submit(&self.device, &self.queue, "upload staging");
+                submission
+            });
             #[cfg(all(unix, not(target_vendor = "apple")))]
             if let Some(native) = self.native.as_mut()
                 && (!native.staged.is_empty() || !native.releases.is_empty())
@@ -7645,6 +7773,7 @@ impl GpuRenderer {
             }
             buffers.push(encoder.finish());
             let submission = self.queue.submit(buffers);
+            track_submission(&self.queue, &self.tracker);
             #[cfg(all(unix, not(target_vendor = "apple")))]
             if let Some(native) = self.native.as_mut()
                 && !native.staged.is_empty()
@@ -7701,10 +7830,11 @@ impl GpuRenderer {
                     }
                 });
             }
-            submission
+            (upload_submission, submission)
         };
-        if uploads.is_some() {
-            self.uploads.submitted(submission.clone());
+        let (upload_submission, submission) = submission;
+        if let Some(upload_submission) = upload_submission {
+            self.uploads.submitted(upload_submission);
         }
         diag::submit(&self.device, &self.queue, "frame");
         self.frame_submission = Some(submission.clone());
@@ -7719,41 +7849,33 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Waits for a submission's completion — a deadline on GPU progress,
+    /// not on the wait itself. Each `wait_timeout` window that elapses is
+    /// judged against [`SubmissionTracker`]: any submission retiring inside
+    /// the window proves a slow adapter is still draining, so the wait
+    /// warns and opens another window; a whole window with zero retirements
+    /// is a wedged queue and fails as [`RenderError::Timeout`]. Device loss
+    /// still surfaces immediately as [`RenderError::DeviceLost`].
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(
         &self,
-        submission: wgpu::SubmissionIndex,
+        submission: &wgpu::SubmissionIndex,
         what: &'static str,
     ) -> Result<(), RenderError> {
-        let start = Instant::now();
-        let status = self.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
-            timeout: Some(self.wait_timeout),
-        });
-        diag::poll(&self.device, status.is_ok());
-        let elapsed = start.elapsed();
-        match status {
-            Ok(status) => {
-                tracing::trace!(
-                    what,
-                    ?status,
-                    wait_ms = elapsed.as_secs_f64() * 1e3,
-                    "waited"
-                );
-                Ok(())
-            }
-            Err(wgpu::PollError::Timeout) => {
-                tracing::error!(what, ?elapsed, "GPU wait timed out");
-                Err(RenderError::Timeout {
-                    what,
-                    timeout: self.wait_timeout,
-                })
-            }
-            Err(e) => {
-                tracing::error!(what, %e, "GPU wait failed");
-                Err(RenderError::DeviceLost)
-            }
-        }
+        wait_with_progress(
+            what,
+            self.wait_timeout,
+            submission,
+            || {
+                let status = self.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission.clone()),
+                    timeout: Some(self.wait_timeout),
+                });
+                diag::poll(&self.device, status.is_ok());
+                status
+            },
+            || self.tracker.retired(),
+        )
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -7777,7 +7899,7 @@ impl GpuRenderer {
     fn map_read(
         &self,
         slice: wgpu::BufferSlice<'_>,
-        submission: wgpu::SubmissionIndex,
+        submission: &wgpu::SubmissionIndex,
         what: &'static str,
     ) -> Result<(), RenderError> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -7872,6 +7994,7 @@ impl GpuRenderer {
             }
             self.queue.submit([encoder.finish()])
         };
+        track_submission(&self.queue, &self.tracker);
         let shared = native.shared.clone();
         for release in &mut releases {
             // Same ordering as the frame submit path: export while the
@@ -7922,6 +8045,7 @@ impl GpuRenderer {
         );
         encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, u64::from(pending.count) * 8);
         let submission = self.queue.submit([encoder.finish()]);
+        track_submission(&self.queue, &self.tracker);
         diag::submit(&self.device, &self.queue, "timestamp resolve");
         tracing::trace!(
             frame = pending.frame.get(),
@@ -8462,7 +8586,76 @@ impl Drop for GpuRenderer {
         {
             // Completion callbacks run under the poll; a timeout leaves
             // the releases queued — the device drop reclaims the objects.
-            drop(self.wait(submission, "external frame teardown"));
+            drop(self.wait(&submission, "external frame teardown"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drives the window decision with scripted poll outcomes and a
+    /// scripted retirement frontier — no device needed.
+    fn drive(
+        polls: impl IntoIterator<Item = Result<wgpu::PollStatus, wgpu::PollError>>,
+        retired: impl IntoIterator<Item = u64>,
+    ) -> Result<(), RenderError> {
+        let mut polls = polls.into_iter();
+        let mut retired = retired.into_iter();
+        wait_with_progress::<u64>(
+            "test wait",
+            Duration::from_secs(30),
+            &0,
+            move || polls.next().expect("scripted poll"),
+            move || retired.next().expect("scripted frontier"),
+        )
+    }
+
+    #[test]
+    fn wait_returns_when_the_submission_completes() {
+        let outcome = drive([Ok(wgpu::PollStatus::WaitSucceeded)], [0]);
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn progress_inside_a_window_keeps_the_wait_open() {
+        // Two elapsed windows while the frontier still advances — a slow
+        // but draining queue — then completion: the wait succeeds.
+        let outcome = drive(
+            [
+                Err(wgpu::PollError::Timeout),
+                Err(wgpu::PollError::Timeout),
+                Ok(wgpu::PollStatus::WaitSucceeded),
+            ],
+            [0, 1, 2],
+        );
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn a_window_with_no_progress_times_out() {
+        // The frontier never moves across the first elapsed window: the
+        // queue is wedged and the wait fails instead of opening another.
+        let outcome = drive(
+            [
+                Err(wgpu::PollError::Timeout),
+                Ok(wgpu::PollStatus::WaitSucceeded),
+            ],
+            [0, 0],
+        );
+        assert!(matches!(
+            outcome,
+            Err(RenderError::Timeout {
+                what: "test wait",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn poll_errors_other_than_timeout_still_fail_fast() {
+        let outcome = drive([Err(wgpu::PollError::WrongSubmissionIndex(9, 3))], [0]);
+        assert!(matches!(outcome, Err(RenderError::DeviceLost)));
     }
 }

@@ -188,7 +188,13 @@ pub struct GpuConfig {
     /// with timestamp queries resolved after completion and reported on a
     /// later render, never stalling the frame on GPU idle.
     pub timestamps: bool,
-    /// Maximum duration of a GPU wait.
+    /// Window of a native GPU wait, and the deadline of a browser one.
+    /// A native wait opens a new window every time the queue retires any
+    /// submission — a slow adapter keeps draining — and fails with
+    /// [`RenderError::Timeout`] only when a whole window passes with
+    /// nothing retired: a deadline on progress, not on duration. On
+    /// wasm32, where a wait resolves on the page's event loop, it is a
+    /// hard timeout.
     pub wait_timeout: std::time::Duration,
     /// Memory budgets.
     pub budget: cherenkov::Budget,

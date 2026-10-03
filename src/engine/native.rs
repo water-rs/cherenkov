@@ -152,9 +152,10 @@ impl<B: Backend> Engine<B> {
     /// reports no GPU timing or has nothing outstanding.
     ///
     /// # Errors
-    /// [`RenderError::Timeout`] when the GPU does not finish in time,
-    /// [`RenderError::Readback`] when a timing buffer cannot be read, and
-    /// [`RenderError::Thread`] when the render thread is gone.
+    /// [`RenderError::Timeout`] when the GPU makes no progress for a
+    /// wait window, [`RenderError::Readback`] when a timing buffer cannot
+    /// be read, and [`RenderError::Thread`] when the render thread is
+    /// gone.
     pub fn finish_timings(&self) -> Result<Vec<FrameTiming>, RenderError> {
         let (reply, rx) = std::sync::mpsc::channel();
         self.tx

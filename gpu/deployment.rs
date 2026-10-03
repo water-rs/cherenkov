@@ -11,11 +11,11 @@ pub fn require_floor(version: &str) {
         .expect("deployment version")
         .parse()
         .expect("rustc reports a numeric deployment version");
-    if major < 26 {
-        panic!(
-            "cherenkov-gpu requires macOS/iOS 26 or newer; resolved deployment target is {version}. Set MACOSX_DEPLOYMENT_TARGET or IPHONEOS_DEPLOYMENT_TARGET to 26.0 or newer."
-        );
-    }
+    // Present in every profile, including release.
+    assert!(
+        major >= 26,
+        "cherenkov-gpu requires macOS/iOS 26 or newer; resolved deployment target is {version}. Set MACOSX_DEPLOYMENT_TARGET or IPHONEOS_DEPLOYMENT_TARGET to 26.0 or newer."
+    );
 }
 
 #[cfg(test)]

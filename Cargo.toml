@@ -41,6 +41,7 @@ serde_json = "1"
 resolver = "3"
 members = [
     ".",
+    "record",
     "filtrate",
     "filtrate/core",
     "filtrate/derive",

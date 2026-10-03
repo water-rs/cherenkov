@@ -483,6 +483,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cherenkov-record"
+version = "0.0.0"
+dependencies = [
+ "color",
+ "kurbo",
+ "nami",
+ "nami-core",
+ "serde",
+ "serde_json",
+ "web-time",
+]
+
+[[package]]
 name = "cherenkov-scene"
 version = "0.0.0"
 dependencies = [

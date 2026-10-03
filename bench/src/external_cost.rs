@@ -257,6 +257,12 @@ impl Ramps {
 /// too; an Android external-format import does not.
 const CONVERT_WGSL: &str = include_str!("external_convert.wgsl");
 
+/// The convert pipeline's whole module: the engine's decode, then
+/// [`CONVERT_WGSL`].
+fn convert_source() -> String {
+    [cherenkov_gpu::bench::DECODE_WGSL, CONVERT_WGSL].concat()
+}
+
 /// Queries per set: the largest multiple of 3 that fits in one set.
 const fn query_span() -> u32 {
     (wgpu::QUERY_SET_MAX_QUERIES / 3) * 3
@@ -380,11 +386,7 @@ impl GpuContent for Convert {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("external-cost convert"),
-                source: wgpu::ShaderSource::Wgsl(
-                    [cherenkov_gpu::bench::DECODE_WGSL, CONVERT_WGSL]
-                        .concat()
-                        .into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(convert_source().into()),
             });
         let pipeline = ctx
             .device

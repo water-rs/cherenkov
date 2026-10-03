@@ -13,8 +13,8 @@ testing = []
 
 [dependencies]
 arc-swap = "1"
+cherenkov-record = { path = "record", features = ["serde"] }
 web-time = "1"
-color = { version = "0.3.3", features = ["serde"] }
 filtrate-core = { path = "filtrate/core" }
 kurbo = { version = "0.13.1", features = ["serde"] }
 libm = "0.2"

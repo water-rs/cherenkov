@@ -11,7 +11,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::SyncSender as Sender;
@@ -102,6 +102,9 @@ pub struct Shared<B: Backend> {
     /// operand arrives, so [`Shared::take_changes`] skips per-content
     /// sampling probes on surfaces that never saw one.
     animated: Rc<Cell<bool>>,
+    /// The `LiveOwner` handle installed contents attach to, created on
+    /// first install and held for the surface's life.
+    owner: Option<Rc<dyn LiveOwner>>,
 }
 
 #[derive(Default)]
@@ -138,6 +141,7 @@ impl<B: Backend> Shared<B> {
             tx,
             display: Cell::new(Display::default()),
             animated: Rc::new(Cell::new(false)),
+            owner: None,
         }
     }
 
@@ -308,9 +312,16 @@ pub trait LayerOwner {
     fn remove(&self, id: LayerId);
 }
 
-impl<B: Backend> LiveOwner for RefCell<Shared<B>> {
+/// The surface as an installed content's live-operand owner: a
+/// signal change queues the surface. It weakly holds the surface, which
+/// holds the one [`Rc`] of it, so neither keeps the other alive.
+struct Owner<B: Backend>(Weak<RefCell<Shared<B>>>);
+
+impl<B: Backend> LiveOwner for Owner<B> {
     fn changed(&self) {
-        self.borrow_mut().queued();
+        if let Some(shared) = self.0.upgrade() {
+            shared.borrow_mut().queued();
+        }
     }
 }
 
@@ -1302,12 +1313,17 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
+                        let owner = shared
+                            .owner
+                            .get_or_insert_with(|| {
+                                Rc::new(Owner(Rc::downgrade(&self.shared))) as Rc<dyn LiveOwner>
+                            })
+                            .clone();
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
                             slot.spare.live = previous.retire().live;
                         }
                         let stored = slot.content.as_mut().expect("just inserted");
-                        let owner: Rc<dyn LiveOwner> = Rc::clone(&self.shared) as Rc<dyn LiveOwner>;
                         stored.attach_owner(Rc::downgrade(&owner), &animated);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {

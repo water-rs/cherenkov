@@ -4,8 +4,8 @@
 //!
 //! Shaping stays outside the engine. [`TextLayout::new`] resolves every
 //! font the layout shaped with to an engine [`Font`] and lowers the layout
-//! once; [`Draw::text`](crate::Draw::text) then records those primitives at
-//! an origin, so text reaches both backends through the same glyph-run
+//! once; [`draw_text`] then records those primitives at an origin through
+//! any [`Draw`], so text reaches both backends through the same glyph-run
 //! path as [`Draw::glyphs`](crate::Draw::glyphs).
 
 use std::sync::Arc;
@@ -17,9 +17,9 @@ use crate::error::ResourceError;
 use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
 use crate::paint::Paint;
 use crate::resource::{Font, FontSource};
+use crate::{Draw, Fixed, Group};
 
-/// A shaped parley layout, ready to record with
-/// [`Draw::text`](crate::Draw::text).
+/// A shaped parley layout, ready to record with [`draw_text`].
 ///
 /// Every style's brush is a [`Paint`]. The layout lowers to:
 /// - one [`GlyphRun`] per parley glyph run, filled with the style's brush;
@@ -256,6 +256,54 @@ fn contiguous(last: &Stripe, start: f32, top: f32, size: f32) -> bool {
     last.end == start && last.top == top && last.size == size
 }
 
+/// Records `layout`'s lowered primitives into `draw` with the layout's
+/// top-left at `origin`.
+///
+/// The primitives are the [`Draw::glyphs`], [`Draw::fill`] and
+/// [`Draw::group`] commands [`TextLayout`] lowers to, recorded as
+/// constants — a layout is not a signal, so nothing subscribes, and a new
+/// layout is a new recording.
+pub fn draw_text<D>(draw: &mut D, layout: &TextLayout, origin: Point)
+where
+    D: Draw,
+    // The lowered primitives are constants: `Fixed` moves them into the
+    // commands without a signal snapshot.
+    D::Value<GlyphRun>: From<Fixed<GlyphRun>>,
+    D::Value<Paint>: From<Fixed<Paint>>,
+    D::Value<Rect>: From<Fixed<Rect>>,
+    D::Value<Group>: From<Fixed<Group>>,
+{
+    for command in layout.commands() {
+        match command {
+            TextCommand::Glyphs(run, paint) => {
+                draw.glyphs(Fixed(place_run(run, origin)), Fixed(paint.clone()));
+            }
+            TextCommand::Bold(run, stroke, paint) => {
+                let fill = place_run(run, origin);
+                let outline = GlyphRun {
+                    style: GlyphStyle::Stroke(stroke.clone()),
+                    ..fill.clone()
+                };
+                // With one opaque colour, the fill and then the stroke
+                // composite to exactly what the isolated pair does; any
+                // other paint would blend twice where the two overlap.
+                if matches!(paint, Paint::Solid(color) if color.components[3] >= 1.0) {
+                    draw.glyphs(Fixed(fill), Fixed(paint.clone()));
+                    draw.glyphs(Fixed(outline), Fixed(paint.clone()));
+                } else {
+                    draw.group(Fixed(Group::new()), |draw| {
+                        draw.glyphs(Fixed(fill), Fixed(paint.clone()));
+                        draw.glyphs(Fixed(outline), Fixed(paint.clone()));
+                    });
+                }
+            }
+            TextCommand::Fill(rect, paint) => {
+                draw.fill(Fixed(*rect + origin.to_vec2()), Fixed(paint.clone()));
+            }
+        }
+    }
+}
+
 /// `run` moved by `origin`: glyph positions add in f64 and round once to
 /// the run's f32.
 #[expect(
@@ -303,14 +351,14 @@ mod tests {
         PositionedLayoutItem, StyleProperty,
     };
 
-    use super::{TextCommand, TextLayout};
+    use super::{TextCommand, TextLayout, draw_text};
     use crate::display_list::Command;
     use crate::error::ResourceError;
     use crate::glyph::{FontId, GlyphStyle};
     use crate::paint::Paint;
     use crate::resource::Font;
     use crate::shape::ShapeData;
-    use crate::{Draw, Group, Picture, WorkingColor};
+    use crate::{Group, Picture, WorkingColor};
 
     const INK: Paint = Paint::Solid(WorkingColor::new([0.1, 0.2, 0.3, 1.0]));
     const RED: Paint = Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
@@ -565,7 +613,7 @@ mod tests {
         assert_eq!(stroke.join, kurbo::Join::Miter);
         assert_eq!(ink.style, GlyphStyle::Fill);
 
-        let picture = Picture::record(|c| c.text(&lowered, Point::ZERO));
+        let picture = Picture::record(|c| draw_text(c, &lowered, Point::ZERO));
         let recorded = picture.display_list().commands();
         let run = |command: &Command| match command {
             Command::Glyphs { run, paint } => {
@@ -603,7 +651,7 @@ mod tests {
         )
         .expect("lowers");
         let origin = Point::new(12.5, 40.25);
-        let picture = Picture::record(|c| c.text(&lowered, origin));
+        let picture = Picture::record(|c| draw_text(c, &lowered, origin));
         let recorded = picture.display_list().commands();
         assert_eq!(recorded.len(), lowered.commands().len());
         for (command, lowered) in recorded.iter().zip(lowered.commands()) {

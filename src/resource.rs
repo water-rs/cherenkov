@@ -16,6 +16,8 @@ use crate::message::{BackdropId, BackdropShaderId};
 use crate::paint::ImageId;
 use crate::style::FilterId;
 
+pub use cherenkov_record::ResourceId;
+
 /// The data of a font to register with the engine.
 #[derive(Clone)]
 pub struct FontSource {
@@ -64,39 +66,6 @@ impl FontSource {
 /// Queues a replacement of an image's pixels, ordered with every other
 /// message the engine sends.
 pub type ReplaceImage = Rc<dyn Fn(ImageId, ImageUpload) -> Result<(), ResourceError>>;
-
-/// A registered resource that installed content or a layer can draw.
-///
-/// The render loop frees a released resource only once no surface draws
-/// it, and a [`RenderError::Rejected`] names the resource the backend
-/// rejected after its handle was returned. That is never a font: every
-/// check a font needs runs before [`Engine::font`](crate::Engine::font)
-/// returns.
-///
-/// [`RenderError::Rejected`]: crate::RenderError::Rejected
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ResourceId {
-    /// A font from [`Engine::font`](crate::Engine::font).
-    Font(FontId),
-    /// An image from [`Engine::image`](crate::Engine::image).
-    Image(ImageId),
-    /// A shader from [`Engine::shader`](crate::Engine::shader).
-    Shader(ShaderId),
-    /// A backdrop effect shader from
-    /// [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
-    BackdropShader(BackdropShaderId),
-}
-
-impl std::fmt::Display for ResourceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Font(id) => write!(f, "font {}", id.raw()),
-            Self::Image(id) => write!(f, "image {}", id.raw()),
-            Self::Shader(id) => write!(f, "shader {}", id.raw()),
-            Self::BackdropShader(id) => write!(f, "backdrop shader {}", id.raw()),
-        }
-    }
-}
 
 /// The shared state of a resource handle: the last `Rc` drop runs
 /// `on_drop`, which queues the resource's `remove_*` op. `ops` carries the
@@ -361,7 +330,7 @@ impl BackdropSample {
 /// Dropping the last clone unregisters it once no layer samples it.
 #[derive(Debug)]
 pub struct BackdropShader {
-    inner: Rc<Inner<crate::message::BackdropShaderId>>,
+    inner: Rc<Inner<BackdropShaderId>>,
     reach: f32,
 }
 
@@ -375,11 +344,7 @@ impl Clone for BackdropShader {
 }
 
 impl BackdropShader {
-    pub(crate) fn new(
-        id: crate::message::BackdropShaderId,
-        reach: f32,
-        on_drop: impl FnOnce() + 'static,
-    ) -> Self {
+    pub(crate) fn new(id: BackdropShaderId, reach: f32, on_drop: impl FnOnce() + 'static) -> Self {
         Self {
             inner: handle(id, on_drop),
             reach,
@@ -388,7 +353,7 @@ impl BackdropShader {
 
     /// The identifier [`BackdropShaderEffect`] references.
     #[must_use]
-    pub fn id(&self) -> crate::message::BackdropShaderId {
+    pub fn id(&self) -> BackdropShaderId {
         self.inner.id
     }
 

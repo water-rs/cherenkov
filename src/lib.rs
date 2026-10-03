@@ -16,29 +16,24 @@
 //!   commit per frame, samples the animations at the frame time and renders
 //!   on the render thread.
 
-mod animation;
+// The recording layer is `cherenkov-record`; these imports keep its
+// modules at their old `crate::*` paths so engine code is unchanged.
+use cherenkov_record::{animation, color, display_list, glyph, paint, record, shape, size, style};
+
 mod backdrop;
 mod backend;
 mod capability;
-mod color;
 mod config;
-mod display_list;
 mod engine;
 mod error;
 mod frame;
-mod glyph;
 mod image;
 #[cfg(target_arch = "wasm32")]
 mod local;
 pub mod lowering;
 mod message;
-mod paint;
 mod projective;
-mod record;
 mod resource;
-mod shape;
-mod size;
-mod style;
 mod surface;
 mod text;
 mod tree;
@@ -89,9 +84,7 @@ pub use crate::image::{
     Astc4x4, Bc7, Etc2Rgba, Format, ImageColorSpace, ImageData, ImageFormat, ImageUpload, Rgba8,
     Rgba16F,
 };
-pub use crate::message::{
-    BackdropId, BackdropShaderId, ContentOp, FontData, LayerId, Prop, SurfaceId,
-};
+pub use crate::message::{BackdropId, ContentOp, FontData, LayerId, Prop, SurfaceId};
 pub use crate::paint::{
     ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient,
     MeshColorInterpolation, MeshGradient, MeshGradientError, Paint, RadialGradient, Sampling,
@@ -100,8 +93,7 @@ pub use crate::paint::{
 pub use crate::projective::{Projective, ProjectiveError};
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
 pub use crate::resource::{
-    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, ResourceId,
-    Shader,
+    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, Shader,
 };
 pub use crate::shape::{
     ContinuousRect, EvenOdd, FillRule, PATH_TOLERANCE, PathRef, Semantic, Shape, ShapeData,
@@ -112,6 +104,8 @@ pub use crate::surface::{
     ExternalFrameHandle, ExternalFrameInstall, GpuContentHandle, Layer, LayerContent, LayerEdit,
     Surface, Transaction,
 };
-pub use crate::text::TextLayout;
+pub use crate::text::{TextLayout, draw_text};
 pub use crate::tree::{LayerNode, SurfaceTree, snap_animating};
+pub use cherenkov_record::BackdropShaderId;
+pub use cherenkov_record::ResourceId;
 pub use kurbo::Stroke;

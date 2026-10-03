@@ -106,24 +106,10 @@ impl BackdropId {
     }
 }
 
-/// Identifier of a backdrop effect shader, allocated by
-/// [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BackdropShaderId(u64);
-
-impl BackdropShaderId {
-    /// Creates an identifier from a raw value.
-    #[must_use]
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// The raw value.
-    #[must_use]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
+// `BackdropShaderId` lives in `cherenkov-record` with the other plain
+// resource ids; re-exported so `crate::message::BackdropShaderId` still
+// resolves.
+pub use cherenkov_record::BackdropShaderId;
 
 /// A font crossing to the render thread.
 #[derive(Clone)]

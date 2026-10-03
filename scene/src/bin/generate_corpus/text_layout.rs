@@ -1,5 +1,5 @@
 //! Text-layout scenes (#26): parley layouts the Cherenkov adapters record
-//! through the engine's `Draw::text`.
+//! through the engine's `draw_text`.
 //!
 //! Each scene's text layer carries the parley input ([`TextSource`]) and,
 //! as its items, the reference lowering written here: one glyph run per

@@ -516,3 +516,34 @@ fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 }
+
+split_test! {
+fn retained_painter_commands_follow_content_revisions() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = wait!(engine()) else {
+        return Ok(());
+    };
+    let actual = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
+    // Same command layout with new instance data, buffer growth, fewer
+    // commands, and an empty pass must all agree with a fresh recording.
+    for (count, color) in [(1, [1., 0., 0., 1.]), (1, [0., 1., 0., 1.]),
+        (96, [0., 0., 1., 0.5]), (2, [1., 1., 0., 1.]), (0, [0.; 4]), (3, [1.; 4])] {
+        let record = |c: &mut cherenkov::Recorder| {
+            for index in 0..count {
+                let x = f64::from(index % 4).mul_add(12.0, 8.0);
+                let y = f64::from((index / 4) % 4).mul_add(12.0, 8.0);
+                let rect = Rect::new(x, y, x + 6.0, y + 6.0);
+                c.shadow(rect, cherenkov::Shadow::new(1.0, WorkingColor::new([0., 0., 0., 0.5])));
+                c.fill(rect, WorkingColor::new(color));
+            }
+        };
+        actual.update(|tx| { tx[actual.root()].content(actual.record(record)); });
+        wait!(engine.render(cherenkov::FrameTime::now()))?;
+        let pixels = wait!(actual.readback())?.pixels;
+        let fresh = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
+        fresh.update(|tx| { tx[fresh.root()].content(fresh.record(record)); });
+        wait!(engine.render(cherenkov::FrameTime::now()))?;
+        assert_eq!(pixels, wait!(fresh.readback())?.pixels, "painter revision with {count} cards");
+    }
+    Ok(())
+}
+}

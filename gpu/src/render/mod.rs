@@ -239,6 +239,17 @@ pub struct GpuBitmap {
     pub(super) em: kurbo::Rect,
 }
 
+/// Validated painter commands; uploads may change their instance contents.
+struct PainterReplay {
+    bind0: wgpu::BindGroup,
+    bind1: wgpu::BindGroup,
+    offset: u32,
+    base: u32,
+    format: wgpu::TextureFormat,
+    ranges: Vec<(ShaderVariant, std::ops::Range<u32>)>,
+    bundle: wgpu::RenderBundle,
+}
+
 /// One surface's GPU-side state.
 struct SurfaceState {
     window: Option<present::WindowSurface>,
@@ -311,6 +322,7 @@ struct SurfaceState {
     /// mask texture)`, reused across frames while `binds1_stamp` is
     /// current.
     binds1: FxHashMap<Bind1Key, wgpu::BindGroup>,
+    painter_replays: FxHashMap<usize, PainterReplay>,
     /// The `(bind_gen, images_gen, mask_texture_gen)` triple `binds1` was
     /// built under.
     binds1_stamp: (u64, u64, u64),
@@ -2601,6 +2613,7 @@ impl Renderer for GpuRenderer {
                 globals_base: 0,
                 bind_gen: 0,
                 binds1: FxHashMap::default(),
+                painter_replays: FxHashMap::default(),
                 binds1_stamp: (u64::MAX, u64::MAX, u64::MAX),
                 projective: FxHashMap::default(),
                 realized: Vec::new(),
@@ -2714,6 +2727,7 @@ impl Renderer for GpuRenderer {
         state.tile_targets.clear();
         state.backdrop = [None, None];
         state.binds1.clear();
+        state.painter_replays.clear();
         state.bind_gen += 1;
         diag::grow(
             &self.device,
@@ -2831,6 +2845,7 @@ impl Renderer for GpuRenderer {
         if state.content.remove(&layer).is_some() {
             diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
             state.binds1.clear();
+            state.painter_replays.clear();
         }
         state.external.remove(&layer);
         match content {
@@ -2873,6 +2888,7 @@ impl Renderer for GpuRenderer {
                     "content change",
                 );
                 state.binds1.clear();
+                state.painter_replays.clear();
             }
         }
     }
@@ -3064,6 +3080,7 @@ impl Renderer for GpuRenderer {
             }
             // The bind groups' views died with the textures.
             surf.binds1.clear();
+            surf.painter_replays.clear();
             surf.bind_gen += 1;
             // Local images the latest frame did not compose are optional;
             // under critical pressure every one goes and is realized again
@@ -3242,7 +3259,18 @@ impl Renderer for GpuRenderer {
             .flat_map(|g| &g.captures)
             .map(|c| format_name(c.texture.format()))
             .next();
-        let cpu = self.atlas.cpu_bytes();
+        let cpu = self.atlas.cpu_bytes()
+            + self
+                .surfaces
+                .values()
+                .flat_map(|surface| surface.painter_replays.values())
+                .map(|replay| {
+                    (std::mem::size_of::<PainterReplay>()
+                        + replay.ranges.capacity()
+                            * std::mem::size_of::<(ShaderVariant, std::ops::Range<u32>)>())
+                        as u64
+                })
+                .sum::<u64>();
         #[cfg(target_vendor = "apple")]
         let cpu = cpu
             + self
@@ -4343,6 +4371,7 @@ impl GpuRenderer {
         );
         diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
         state.binds1.clear();
+        state.painter_replays.clear();
     }
 
     /// Installs a retained external frame on `layer` (`cherenkov::ExternalFrames`).
@@ -6304,6 +6333,7 @@ impl GpuRenderer {
                     atlas,
                 );
                 self.bound_atlas = atlas.generation();
+                self.invalidate_painter_replays();
             }
         }
         // Buffers grown above leave `bind0` stale; rebuild when capacity
@@ -6323,12 +6353,19 @@ impl GpuRenderer {
                 atlas,
             );
             self.bound_atlas = atlas.generation();
+            self.invalidate_painter_replays();
             self.bound_instance_size = self.instances.size();
             self.bound_stop_size = self.stops.size();
             self.bound_globals_size = self.globals.size();
         }
 
         Ok(())
+    }
+
+    fn invalidate_painter_replays(&mut self) {
+        for surface in self.surfaces.values_mut() {
+            surface.painter_replays.clear();
+        }
     }
 
     /// Grows each frame-wide buffer once for the frame's whole upload
@@ -6557,10 +6594,6 @@ impl GpuRenderer {
             .native
             .is_some()
             .then(|| unsafe { self.adapter.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan"));
-        let Some(surf) = self.surfaces.get_mut(&id) else {
-            return Ok(());
-        };
-        diag::set_surface(Some(id.raw()));
         // Buffers grown during lowering leave `bind0` stale; rebuild when
         // capacity changed since the bind group was built.
         if self.instances.size() > self.bound_instance_size
@@ -6581,7 +6614,12 @@ impl GpuRenderer {
             self.bound_instance_size = self.instances.size();
             self.bound_stop_size = self.stops.size();
             self.bound_globals_size = self.globals.size();
+            self.invalidate_painter_replays();
         }
+        let Some(surf) = self.surfaces.get_mut(&id) else {
+            return Ok(());
+        };
+        diag::set_surface(Some(id.raw()));
         let inst_base = surf.inst_base;
         // wgpu forbids mixing its encoding API with raw `as_hal_mut`
         // access on one encoder, so every native command buffer — the
@@ -6623,6 +6661,7 @@ impl GpuRenderer {
                 diag::bind_groups_dropped(&self.device, dropped, "stamp change");
             }
             surf.binds1.clear();
+            surf.painter_replays.clear();
             surf.binds1_stamp = stamp;
         }
         let factory = PipelineFactory {
@@ -6632,6 +6671,8 @@ impl GpuRenderer {
             cache: self.pipeline_cache.as_ref(),
             delivery: self.shader_delivery,
         };
+        surf.painter_replays
+            .retain(|index, _| *index < surf.frame.passes.len());
         let mask_gen = self.atlas.mask_texture_generation();
         let mut i = 0;
         while i < surf.frame.passes.len() {
@@ -6686,6 +6727,18 @@ impl GpuRenderer {
                         && range.image.is_none()
                         && range.mask.is_none()
                 });
+            let replayable = !coverage_order
+                && !pass.ranges.is_empty()
+                && pass.ranges.iter().all(|range| {
+                    range.pipeline == PipelineKind::SrcOver
+                        && matches!(range.variant, ShaderVariant::Simple | ShaderVariant::Shadow)
+                        && range.source.is_none()
+                        && range.image.is_none()
+                        && range.mask.is_none()
+                });
+            if !replayable {
+                surf.painter_replays.remove(&i);
+            }
             if coverage_order
                 && surf
                     .coverage_depth
@@ -7057,7 +7110,103 @@ impl GpuRenderer {
                 Target::Part(_) | Target::Projected(_) | Target::Plane(_) => 0,
                 Target::Scratch(_) | Target::Backdrop { .. } => 1,
             });
-            let mut ri = 0usize;
+            if replayable {
+                let bind1 = surf
+                    .binds1
+                    .entry((None, false, None, None))
+                    .or_insert_with(|| {
+                        stats.bind_groups_created += 1;
+                        make_bind1(
+                            &self.device,
+                            &self.layout1,
+                            &self.dummy_view,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    });
+                let current = surf.painter_replays.get(&i).is_some_and(|replay| {
+                    replay.bind0 == self.bind0
+                        && replay.bind1 == *bind1
+                        && replay.offset == offset
+                        && replay.base == inst_base
+                        && replay.format == target_format
+                        && replay.ranges.len() == pass.ranges.len()
+                        && replay.ranges.iter().zip(&pass.ranges).all(
+                            |((variant, instances), range)| {
+                                *variant == range.variant && *instances == range.instances
+                            },
+                        )
+                });
+                if !current {
+                    for range in &pass.ranges {
+                        core_pipeline(
+                            &mut self.pipelines,
+                            &factory,
+                            target_format,
+                            false,
+                            range.variant,
+                        )?;
+                    }
+                    let mut bundle = self.device.create_render_bundle_encoder(
+                        &wgpu::RenderBundleEncoderDescriptor {
+                            label: Some("retained painter"),
+                            color_formats: &[Some(target_format)],
+                            depth_stencil: None,
+                            sample_count: 1,
+                            multiview: None,
+                        },
+                    );
+                    bundle.set_bind_group(0, &self.bind0, &[offset]);
+                    bundle.set_bind_group(1, &*bind1, &[]);
+                    let mut variant = None;
+                    for range in &pass.ranges {
+                        if variant != Some(range.variant) {
+                            bundle.set_pipeline(
+                                self.pipelines[format_i][0][variant_index(range.variant)]
+                                    .as_ref()
+                                    .expect("painter pipeline prepared"),
+                            );
+                            variant = Some(range.variant);
+                        }
+                        bundle.draw(
+                            0..6,
+                            (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                        );
+                    }
+                    surf.painter_replays.insert(
+                        i,
+                        PainterReplay {
+                            bind0: self.bind0.clone(),
+                            bind1: bind1.clone(),
+                            offset,
+                            base: inst_base,
+                            format: target_format,
+                            ranges: pass
+                                .ranges
+                                .iter()
+                                .map(|range| (range.variant, range.instances.clone()))
+                                .collect(),
+                            bundle: bundle.finish(&wgpu::RenderBundleDescriptor {
+                                label: Some("retained painter"),
+                            }),
+                        },
+                    );
+                }
+                render_pass.execute_bundles([&surf.painter_replays[&i].bundle]);
+                stats.draws +=
+                    u32::try_from(pass.ranges.len()).expect("draw ranges fit the instance limit");
+                stats.pipeline_switches += u32::try_from(
+                    pass.ranges
+                        .windows(2)
+                        .filter(|pair| pair[0].variant != pair[1].variant)
+                        .count(),
+                )
+                .expect("pipeline switches fit the instance limit")
+                    + 1;
+            }
+            let mut ri = if replayable { pass.ranges.len() } else { 0 };
             while ri < pass.ranges.len() {
                 let range = &pass.ranges[ri];
                 stats.draws += 1;

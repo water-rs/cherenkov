@@ -24,7 +24,7 @@ fn fs_external_format(in: VsOut) -> @location(0) vec4<f32> {
         default: {
             let s = Shape(in.shape_a.xy, in.shape_a.z, in.shape_a.w, in.shape_radii);
             let m = array<vec4<f32>, 2>(in.affine0, in.affine1);
-            cov = shape_coverage(s, in.local, m);
+            cov = shape_coverage(s, in.local, m, false);
         }
     }
     cov *= clip_mask_coverage(in);

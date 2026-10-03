@@ -451,10 +451,31 @@ pub fn plan<C: Compositor>(
     candidates: &FxHashMap<LayerId, Candidate>,
     ready: &FxHashSet<LayerId>,
 ) -> Plan {
+    let mut result = Plan::default();
+    plan_with::<C>(
+        tree,
+        candidates,
+        ready,
+        &mut PlanScratch::default(),
+        &mut result,
+    );
+    result
+}
+
+/// Rebuild a plan while retaining its workspace and placement-path buffers.
+pub fn plan_with<C: Compositor>(
+    tree: &SurfaceTree,
+    candidates: &FxHashMap<LayerId, Candidate>,
+    ready: &FxHashSet<LayerId>,
+    scratch: &mut PlanScratch,
+    plan: &mut Plan,
+) {
+    plan.rejected.clear();
     if candidates.is_empty() {
-        return Plan::default();
+        plan.planes.clear();
+        plan.trailing = false;
+        return;
     }
-    let mut scratch = PlanScratch::default();
     let PlanScratch {
         order,
         pool,
@@ -463,11 +484,11 @@ pub fn plan<C: Compositor>(
         blend_above,
         device,
         decisions,
-    } = &mut scratch;
+    } = scratch;
     let order = paint_order(tree, order, pool, stack);
     suffixes(tree, order, backdrop_above, blend_above);
     devices(tree, order, device);
-    let mut plan = Plan::default();
+    let mut promoted = 0;
     let mut last = None;
     for (i, verdict) in verdicts::<C>(
         tree,
@@ -481,14 +502,25 @@ pub fn plan<C: Compositor>(
         match verdict {
             Ok(()) => {
                 last = Some(i);
-                plan.planes
-                    .push(placement(tree, order, i, candidates[&order[i].id]));
+                let size = candidates[&order[i].id];
+                if promoted == plan.planes.len() {
+                    plan.planes.push(Placement {
+                        layer: order[i].id,
+                        source: size.source,
+                        size: size.size,
+                        raster: size.raster,
+                        opacity: 1.0,
+                        path: Vec::new(),
+                    });
+                }
+                placement(tree, order, i, size, &mut plan.planes[promoted]);
+                promoted += 1;
             }
             Err(cause) => plan.rejected.push((order[i].id, cause)),
         }
     }
+    plan.planes.truncate(promoted);
     plan.trailing = last.is_some_and(|i| i + 1 < order.len());
-    plan
 }
 
 /// Whether `order[i]`'s placement for content `size` is `placed` — the
@@ -672,31 +704,36 @@ fn judge<C: Compositor>(
     Ok(())
 }
 
-fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: Candidate) -> Placement {
+fn placement(
+    tree: &SurfaceTree,
+    order: &[Visit],
+    i: usize,
+    size: Candidate,
+    placed: &mut Placement,
+) {
     let visit = &order[i];
-    let path = visit
-        .ancestors
-        .iter()
-        .map(|&a| order[a].id)
-        .chain([visit.id])
-        .map(|id| {
-            let node = tree.layer(id);
-            Level {
-                layer: id,
-                transform: node.transform,
-                clip: node.clip.clone(),
-                scroll: node.scroll_offset,
-            }
-        })
-        .collect();
-    Placement {
-        layer: visit.id,
-        source: size.source,
-        size: size.size,
-        raster: size.raster,
-        opacity: tree.layer(visit.id).opacity,
-        path,
-    }
+    placed.path.clear();
+    placed.path.extend(
+        visit
+            .ancestors
+            .iter()
+            .map(|&a| order[a].id)
+            .chain([visit.id])
+            .map(|id| {
+                let node = tree.layer(id);
+                Level {
+                    layer: id,
+                    transform: node.transform,
+                    clip: node.clip.clone(),
+                    scroll: node.scroll_offset,
+                }
+            }),
+    );
+    placed.layer = visit.id;
+    placed.source = size.source;
+    placed.size = size.size;
+    placed.raster = size.raster;
+    placed.opacity = tree.layer(visit.id).opacity;
 }
 
 /// Whether a frame whose only committed change is new external frames on

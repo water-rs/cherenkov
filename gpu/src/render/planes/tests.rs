@@ -1,8 +1,69 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
 use kurbo::{Affine, Rect, RoundedRect, Vec2};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::testing::LayerOp;
 use cherenkov::{BlendMode, FilterId, LayerId, Prop, ShapeData, SurfaceTree};
+
+mod alloc_counter {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static TRACKING: Cell<bool> = const { Cell::new(false) };
+        pub(super) static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        pub(super) static REALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
+use alloc_counter::{ALLOCATIONS, REALLOCATIONS, TRACKING};
+
+struct ThreadAllocator;
+
+#[global_allocator]
+static ALLOCATOR: ThreadAllocator = ThreadAllocator;
+
+unsafe impl GlobalAlloc for ThreadAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if TRACKING.try_with(Cell::get).unwrap_or(false) {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if TRACKING.try_with(Cell::get).unwrap_or(false) {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let pointer = unsafe { System.realloc(pointer, layout, size) };
+        if TRACKING.try_with(Cell::get).unwrap_or(false) {
+            let _ = REALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+        pointer
+    }
+}
+
+fn start_tracking() {
+    ALLOCATIONS.with(|count| count.set(0));
+    REALLOCATIONS.with(|count| count.set(0));
+    TRACKING.with(|tracking| tracking.set(true));
+}
+
+fn stop_tracking() -> (usize, usize) {
+    TRACKING.with(|tracking| tracking.set(false));
+    (ALLOCATIONS.with(Cell::get), REALLOCATIONS.with(Cell::get))
+}
 
 use super::{
     Candidate, Compositor, Ineligible, Level, Plan, PlanScratch, Source, frames_only, plan,
@@ -32,6 +93,64 @@ const ABOVE: LayerId = LayerId::new(2);
 const BELOW: LayerId = LayerId::new(3);
 const PARENT: LayerId = LayerId::new(4);
 const SIZE: (u32, u32) = (320, 180);
+
+#[test]
+fn pose_plans_reuse_workspace_and_placement_paths() {
+    let mut tree = scene();
+    let candidates = video();
+    let ready = candidates.keys().copied().collect();
+    let mut scratch = PlanScratch::default();
+    let mut output = Plan::default();
+    for _ in 0..3 {
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+    }
+    let buffers = (
+        std::ptr::from_ref(&scratch.order[0]),
+        scratch.decisions.as_ptr(),
+        output.planes.as_ptr(),
+        output.planes[0].path.as_ptr(),
+    );
+    for x in 0..10 {
+        tree.apply(LayerOp::Transform(
+            VIDEO,
+            prop(Affine::translate((f64::from(x), 0.))),
+        ));
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+        assert_eq!(output, plan::<Test>(&tree, &candidates, &ready));
+        assert_eq!(
+            buffers,
+            (
+                std::ptr::from_ref(&scratch.order[0]),
+                scratch.decisions.as_ptr(),
+                output.planes.as_ptr(),
+                output.planes[0].path.as_ptr()
+            )
+        );
+    }
+}
+
+#[test]
+fn steady_pose_plan_allocates_nothing() {
+    let mut tree = scene();
+    let candidates = video();
+    let ready = candidates.keys().copied().collect();
+    let mut scratch = PlanScratch::default();
+    let mut output = Plan::default();
+    for _ in 0..4 {
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+    }
+    for x in 0..8 {
+        tree.apply(LayerOp::Transform(
+            VIDEO,
+            prop(Affine::translate((f64::from(x), 0.))),
+        ));
+        start_tracking();
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+        let counts = stop_tracking();
+        assert_eq!(counts, (0, 0), "pose {x}");
+    }
+    assert_eq!(output, plan::<Test>(&tree, &candidates, &ready));
+}
 
 const fn prop<T>(target: T) -> Prop<T> {
     Prop {

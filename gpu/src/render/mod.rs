@@ -623,9 +623,10 @@ pub struct GpuRenderer {
     /// and refilled at the top of every render, so an admission can never
     /// outlive the frame that made it (#90).
     plane_only: Vec<SurfaceId>,
-    /// Workspace `planes::frames_only` reuses across frames, so the
-    /// check allocates nothing steady-state.
+    /// Workspace a pose frame's plan check reuses, including the plan it
+    /// rebuilds, so a steady pose allocates nothing.
     plan_scratch: planes::PlanScratch,
+    next_plan: planes::Plan,
     /// The candidate map each promotion check or plan fills and reuses.
     candidates: FxHashMap<LayerId, planes::Candidate>,
     candidate_frames: FxHashMap<LayerId, (ExternalFrame, u64)>,
@@ -1991,6 +1992,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             planes: FxHashMap::default(),
             plane_only: Vec::new(),
             plan_scratch: planes::PlanScratch::default(),
+            next_plan: planes::Plan::default(),
             candidates: FxHashMap::default(),
             candidate_frames: FxHashMap::default(),
             ready_sets: Vec::new(),
@@ -2299,6 +2301,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         planes: FxHashMap::default(),
         plane_only: Vec::new(),
         plan_scratch: planes::PlanScratch::default(),
+        next_plan: planes::Plan::default(),
         candidates: FxHashMap::default(),
         candidate_frames: FxHashMap::default(),
         ready_sets: Vec::new(),
@@ -5094,7 +5097,14 @@ impl GpuRenderer {
         {
             return false;
         }
-        let next = planes::plan::<planes::Platform>(sf.tree, &self.candidates, &self.ready);
+        planes::plan_with::<planes::Platform>(
+            sf.tree,
+            &self.candidates,
+            &self.ready,
+            &mut self.plan_scratch,
+            &mut self.next_plan,
+        );
+        let next = &self.next_plan;
         if next.trailing != surface.plan.trailing
             || next.planes.len() != surface.plan.planes.len()
             || !next.planes.iter().zip(&surface.plan.planes).all(|(a, b)| {
@@ -5103,10 +5113,14 @@ impl GpuRenderer {
         {
             return false;
         }
-        self.surfaces
-            .get_mut(&sf.id)
-            .expect("registered surface")
-            .plan = next;
+        std::mem::swap(
+            &mut self
+                .surfaces
+                .get_mut(&sf.id)
+                .expect("registered surface")
+                .plan,
+            &mut self.next_plan,
+        );
         true
     }
 

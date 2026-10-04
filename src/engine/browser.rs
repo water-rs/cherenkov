@@ -533,7 +533,7 @@ impl<B: GpuContent> Engine<B> {
     /// [`GpuProducer::at`]. The handle is `Clone`; every clone of the one
     /// view instance's producer shares its renderer state, and there is
     /// no cache keyed by content — a second call is a second producer.
-    /// The last drop retires it through the transaction stream.
+    /// The last drop retires it through the producer's own queue.
     #[must_use]
     pub fn gpu_producer(&self, content: impl Into<B::Content>) -> GpuProducer<B> {
         let id = ProducerId::new(Self::alloc(&self.next_producer));

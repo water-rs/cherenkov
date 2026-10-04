@@ -5,9 +5,9 @@
 //! compositor released it, and when every buffer is held the frame is
 //! skipped with the redraw flag kept — the CPU never blocks.
 
-use super::super::gpu_content::RingBuffer;
 use super::raster;
 use crate::interop::wgpu;
+use crate::render::gpu_content::RingBuffer;
 use cherenkov::RenderError;
 
 /// How many frames the ring keeps in flight: deep enough for the
@@ -55,6 +55,15 @@ impl Buffer {
     /// Whether something outside the engine still retains the buffer's
     /// `IOSurface` — a sample queued on the display layer, or a showing
     /// plane.
+    ///
+    /// Retain count, not `IOSurfaceIsInUse`: the system compositor's
+    /// hold on a scan-out buffer is a retain, the same shape a
+    /// `CVPixelBufferPool` sees when it recycles — `pool_reuse.rs`
+    /// (`gpu/examples/apple_planes/tests`) is the reference: while
+    /// `IOSurfaceIsInUse` gated the pool, a buffer's own liveness kept
+    /// its surface "in use" and the gate could never clear, stalling
+    /// every produce past the pool's depth. A retain above the `free`
+    /// baseline is the hold that must never be drawn into.
     fn held(&self) -> bool {
         self.buffer.surface.retain_count() > self.free
     }

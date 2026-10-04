@@ -370,11 +370,28 @@ impl BackdropShader {
     }
 }
 
-/// The channel a [`GpuProducer`]'s last drop posts its retirement through.
+/// The channel a [`FrameSink`] submits through — the engine's bounded
+/// transaction stream, so a decoder thread's submits keep backpressure.
 #[cfg(not(target_arch = "wasm32"))]
 type ProducerChannel<B> = std::sync::mpsc::SyncSender<crate::message::Message<B>>;
 #[cfg(target_arch = "wasm32")]
 type ProducerChannel<B> = crate::local::Sender<crate::message::Message<B>>;
+
+/// The channel a [`GpuProducer`]'s last drop posts its retirement
+/// through. A [`ProducerShared`] drop runs on any thread — including
+/// the render thread when a binding's last handle dies inside `unbind`,
+/// surface destroy or `drain_gpu_producers` — so it can never ride the
+/// bounded transaction channel: a render thread blocking on `send`
+/// waits on a channel it alone drains. On native the retirement is an
+/// unbounded `mpsc` message the render loop drains after each applied
+/// batch; on wasm the local sender is already unbounded. Ordering is
+/// safe: every pending bind closure holds a clone, so the last drop
+/// follows every bind of the producer, and the renderer records a
+/// retirement that beats the producer's registration to the stream.
+#[cfg(not(target_arch = "wasm32"))]
+type RetireChannel<B> = std::sync::mpsc::Sender<crate::message::ResOp<B>>;
+#[cfg(target_arch = "wasm32")]
+type RetireChannel<B> = crate::local::Sender<crate::message::Message<B>>;
 
 /// The wake callback a [`FrameSink`] fires: thread-safe on native, on the
 /// owning JS thread on wasm32.
@@ -385,21 +402,24 @@ type SinkWake = std::rc::Rc<dyn Fn()>;
 
 /// What a [`GpuProducer`] shares with the copies its binding holds on the
 /// render thread: the last `Arc` drop — handle or binding — retires the
-/// producer through the transaction stream.
+/// producer through the retirement queue.
 struct ProducerShared<B: crate::GpuContent> {
     id: crate::message::ProducerId,
-    tx: ProducerChannel<B>,
+    retire: RetireChannel<B>,
 }
 
 impl<B: crate::GpuContent> Drop for ProducerShared<B> {
     fn drop(&mut self) {
         let id = self.id;
-        // A lost render loop leaves nothing to retire.
-        let _ = self.tx.send(crate::message::Message::Resource(Box::new(
-            move |r: &mut B::Renderer| {
-                B::retire_gpu_producer(r, id);
-            },
-        )));
+        let op: crate::message::ResOp<B> = Box::new(move |r: &mut B::Renderer| {
+            B::retire_gpu_producer(r, id);
+        });
+        // Unbounded, so the send cannot block the render thread it may
+        // run on. A lost render loop leaves nothing to retire.
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.retire.send(op);
+        #[cfg(target_arch = "wasm32")]
+        let _ = self.retire.send(crate::message::Message::Resource(op));
     }
 }
 
@@ -413,11 +433,13 @@ impl<B: crate::GpuContent> Drop for ProducerShared<B> {
 /// and transform stay the layer's own. There is no cache keyed by content:
 /// a second `gpu_producer` call is a second producer.
 ///
-/// The renderer renders the producer's output attachment at most once per
-/// frame, sized to the componentwise largest attachment its drawn bindings
-/// requested, and every binding samples `ImageSource::Content` of the
+/// The renderer draws the producer's frame at most once per frame, sized
+/// to the componentwise largest frame its drawn bindings requested, into
+/// the surface compositor's ring — the ring buffer is the producer's
+/// current frame, and every binding samples `ImageSource::Content` of the
 /// producer's [`id`](Self::id). Dropping the last handle retires the
-/// producer through the transaction stream.
+/// producer through its own unbounded queue — a last drop on the render
+/// thread never blocks on the bounded transaction channel.
 pub struct GpuProducer<B: crate::GpuContent> {
     shared: Arc<ProducerShared<B>>,
 }
@@ -439,9 +461,9 @@ impl<B: crate::GpuContent> Clone for GpuProducer<B> {
 }
 
 impl<B: crate::GpuContent> GpuProducer<B> {
-    pub(crate) fn new(id: crate::message::ProducerId, tx: ProducerChannel<B>) -> Self {
+    pub(crate) fn new(id: crate::message::ProducerId, retire: RetireChannel<B>) -> Self {
         Self {
-            shared: Arc::new(ProducerShared { id, tx }),
+            shared: Arc::new(ProducerShared { id, retire }),
         }
     }
 
@@ -450,16 +472,6 @@ impl<B: crate::GpuContent> GpuProducer<B> {
     #[must_use]
     pub fn id(&self) -> crate::message::ProducerId {
         self.shared.id
-    }
-
-    /// `true` when this handle is the producer's last reference — the
-    /// drop it belongs to is the retirement. The renderer asks this of
-    /// a dying binding so a last drop inside the transaction stream
-    /// retires the producer's resources inline rather than
-    /// round-tripping the retirement back to itself.
-    #[must_use]
-    pub fn is_last(&self) -> bool {
-        Arc::strong_count(&self.shared) == 1
     }
 
     /// Binds the producer to a layer at `size` pixels — the pixel size

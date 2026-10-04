@@ -177,12 +177,20 @@ pub struct NullRenderer {
     removed: HashSet<ResourceId>,
     /// The producers, so `submit_frame` names their bound layers.
     producers: FxHashMap<crate::ProducerId, NullProducer>,
+    /// Retired before its registration reached the stream — the
+    /// producer's own retire queue can beat its add; the add skips an
+    /// id found here.
+    pending_retire: HashSet<crate::ProducerId>,
 }
 
 /// A [`Null`] producer: rendered (`content` `Some`) or submitted-frame.
 struct NullProducer {
     content: Option<()>,
-    bindings: HashSet<(SurfaceId, LayerId)>,
+    /// The bindings hold a [`GpuProducer`](crate::GpuProducer) clone
+    /// like the GPU backend's `Binding` — a binding's unbind drops the
+    /// clone on the render thread, so the last reference can die
+    /// inside the transaction stream.
+    bindings: FxHashMap<(SurfaceId, LayerId), crate::GpuProducer<Null>>,
 }
 
 impl NullRenderer {
@@ -207,6 +215,7 @@ impl NullRenderer {
             pictures: FxHashMap::default(),
             removed: HashSet::new(),
             producers: FxHashMap::default(),
+            pending_retire: HashSet::new(),
         }
     }
 
@@ -244,6 +253,10 @@ impl Backend for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[allow(
+        clippy::future_not_send,
+        reason = "NullRenderer is single-threaded on wasm — its producers' bindings hold GpuProducer clones on the page event loop"
+    )]
     fn init(
         config: NullConfig,
     ) -> impl core::future::Future<Output = Result<(NullRenderer, NullInfo), EngineError>> {
@@ -559,13 +572,15 @@ impl crate::GpuContent for Null {
     }
 
     fn add_gpu_producer(r: &mut NullRenderer, id: crate::ProducerId, _content: ()) {
-        r.producers.insert(
-            id,
-            NullProducer {
-                content: Some(()),
-                bindings: HashSet::new(),
-            },
-        );
+        if !r.pending_retire.remove(&id) {
+            r.producers.insert(
+                id,
+                NullProducer {
+                    content: Some(()),
+                    bindings: FxHashMap::default(),
+                },
+            );
+        }
         let _ = r.events.send(Event::AddProducer(id));
     }
 
@@ -575,13 +590,15 @@ impl crate::GpuContent for Null {
         _dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
         _gate: std::sync::Arc<crate::WakeGate>,
     ) {
-        r.producers.insert(
-            id,
-            NullProducer {
-                content: None,
-                bindings: HashSet::new(),
-            },
-        );
+        if !r.pending_retire.remove(&id) {
+            r.producers.insert(
+                id,
+                NullProducer {
+                    content: None,
+                    bindings: FxHashMap::default(),
+                },
+            );
+        }
         let _ = r.events.send(Event::AddProducer(id));
     }
 
@@ -595,7 +612,7 @@ impl crate::GpuContent for Null {
         let Some(entry) = r.producers.get_mut(&producer.id()) else {
             panic!("binding of an unknown producer {}", producer.id().raw());
         };
-        entry.bindings.insert((surface, layer));
+        entry.bindings.insert((surface, layer), producer.clone());
         let _ = r
             .events
             .send(Event::BindProducer(surface, layer, producer.id()));
@@ -606,10 +623,13 @@ impl crate::GpuContent for Null {
         id: crate::ProducerId,
         _frame: (),
     ) -> Vec<(SurfaceId, LayerId)> {
+        // A submitted frame can reach the renderer after its producer
+        // retired — the producer's own retire queue can beat a queued
+        // `ProducerFrame` message; the frame lands nowhere.
         let Some(producer) = r.producers.get_mut(&id) else {
-            panic!("submit to an unknown producer {}", id.raw());
+            return Vec::new();
         };
-        let mut bound: Vec<_> = producer.bindings.iter().copied().collect();
+        let mut bound: Vec<_> = producer.bindings.keys().copied().collect();
         bound.sort_by_key(|(surface, layer)| (surface.raw(), layer.raw()));
         for &(surface, layer) in &bound {
             let _ = r.events.send(Event::ProducerFrame(surface, layer));
@@ -618,11 +638,11 @@ impl crate::GpuContent for Null {
     }
 
     fn retire_gpu_producer(r: &mut NullRenderer, id: crate::ProducerId) {
-        assert!(
-            r.producers.remove(&id).is_some(),
-            "retirement of unregistered producer {}",
-            id.raw()
-        );
+        // A retirement that beat its producer's registration to the
+        // stream is remembered: the add lands already retired.
+        if r.producers.remove(&id).is_none() {
+            r.pending_retire.insert(id);
+        }
         let _ = r.events.send(Event::RetireProducer(id));
     }
 

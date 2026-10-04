@@ -94,14 +94,6 @@ impl Binding {
     pub fn producer(&self) -> ProducerId {
         self.producer.id()
     }
-
-    /// `true` when the binding's handle is the producer's last
-    /// reference — the binding's drop on the render thread is the
-    /// retirement, so it retires inline rather than round-tripping the
-    /// retire message back to this thread.
-    pub fn is_last(&self) -> bool {
-        self.producer.is_last()
-    }
 }
 
 impl Producer {

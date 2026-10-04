@@ -329,10 +329,18 @@ fn samples_backdrop_shader(tree: &SurfaceTree, id: BackdropShaderId) -> bool {
 
 /// The render loop: runs on the `"cherenkov-render"` thread until
 /// [`Message::Shutdown`] or channel disconnect.
+///
+/// `retire_rx` carries producer retirements on their own unbounded
+/// queue — a binding's last handle can die inside this thread's own
+/// work (`unbind`, surface destroy, `drain_gpu_producers`), and a
+/// retirement sent on the bounded `rx` channel would block this loop
+/// on a channel it alone drains. The queue drains after each applied
+/// message.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run<B: Backend>(
     config: B::Config,
     rx: &Receiver<Message<B>>,
+    retire_rx: &Receiver<crate::message::ResOp<B>>,
     init_reply: &Sender<Result<B::Info, EngineError>>,
 ) {
     let (mut renderer, info) = match B::init(config) {
@@ -410,6 +418,10 @@ pub fn run<B: Backend>(
                     time.0,
                     &mut commits,
                 );
+                // A retirement this frame's unbinds or surface destroys
+                // queued belongs to the frame's batch: the reply tells
+                // the host the frame — retirements included — is done.
+                drain_retire::<B>(retire_rx, &mut renderer);
                 let sender = reply.clone();
                 let _ = sender.send(crate::message::RenderReply {
                     result,
@@ -433,6 +445,16 @@ pub fn run<B: Backend>(
             Message::Trim(pressure) => renderer.trim(pressure),
             Message::Shutdown => break,
         }
+        drain_retire::<B>(retire_rx, &mut renderer);
+    }
+}
+
+/// Applies every queued producer retirement (`thread::run`'s `retire_rx`
+/// drain after each applied message).
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_retire<B: Backend>(rx: &Receiver<crate::message::ResOp<B>>, renderer: &mut B::Renderer) {
+    while let Ok(retire) = rx.try_recv() {
+        retire(renderer);
     }
 }
 

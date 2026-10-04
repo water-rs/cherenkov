@@ -737,6 +737,11 @@ pub struct GpuRenderer {
     /// Every live [`GpuProducer`](cherenkov::GpuProducer) by its
     /// `ProducerId`: renderer-scoped, shared by bindings on any surface.
     producers: FxHashMap<ProducerId, gpu_content::Producer>,
+    /// Retired before its registration reached the stream: a handle
+    /// created and dropped while the add was still queued sends its
+    /// retirement through the producer's own queue, which can beat the
+    /// add to this thread. The add skips a `ProducerId` found here.
+    pending_retire: FxHashSet<ProducerId>,
     fonts: FxHashMap<u64, FontData>,
     /// Registered images.
     images: FxHashMap<u64, GpuImage>,
@@ -2089,6 +2094,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             commit_touches: Vec::new(),
             surfaces: FxHashMap::default(),
             producers: FxHashMap::default(),
+            pending_retire: FxHashSet::default(),
             fonts: FxHashMap::default(),
             images: FxHashMap::default(),
             bitmaps: FxHashMap::default(),
@@ -2394,6 +2400,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         commit_touches: Vec::new(),
         surfaces: FxHashMap::default(),
         producers: FxHashMap::default(),
+        pending_retire: FxHashSet::default(),
         fonts: FxHashMap::default(),
         images: FxHashMap::default(),
         bitmaps: FxHashMap::default(),
@@ -2803,15 +2810,11 @@ impl Renderer for GpuRenderer {
             }
         }
         diag::set_surface(None);
-        // The surface's bindings die on the render thread: a binding
-        // that held its producer's last reference retires it inline.
-        if let Some(state) = self.surfaces.remove(&id) {
-            for binding in state.bindings.values() {
-                if binding.is_last() {
-                    self.producers.remove(&binding.producer());
-                }
-            }
-        }
+        // The surface's bindings die on the render thread: a drop that
+        // held its producer's last reference posts the retirement onto
+        // the producer's own queue, never the channel this thread
+        // consumes.
+        self.surfaces.remove(&id);
         self.planes.remove(&id);
         self.update_filter_activity();
         self.update_producer_gates();
@@ -2864,7 +2867,6 @@ impl Renderer for GpuRenderer {
         let state = self.surfaces.get_mut(&surface)?;
         Self::unbind_producer(
             state,
-            &mut self.producers,
             &self.device,
             self.images_gen,
             self.atlas.mask_texture_generation(),
@@ -2904,7 +2906,6 @@ impl Renderer for GpuRenderer {
             state.composed.retain(|key| key.layer != layer);
             Self::unbind_producer(
                 state,
-                &mut self.producers,
                 &self.device,
                 self.images_gen,
                 self.atlas.mask_texture_generation(),
@@ -4514,8 +4515,14 @@ impl GpuRenderer {
     }
 
     /// Registers a rendered producer's content; the first drawn binding
-    /// runs its `setup` (`cherenkov::GpuContent`).
+    /// runs its `setup` (`cherenkov::GpuContent`). A handle created and
+    /// dropped while this add was still queued already retired the
+    /// producer: its retirement can beat the add on the producer's own
+    /// queue, so a `pending_retire` id lands already retired.
     pub fn add_gpu_producer(&mut self, id: ProducerId, content: crate::interop::GpuContentBox) {
+        if self.pending_retire.remove(&id) {
+            return;
+        }
         self.producers
             .insert(id, gpu_content::Producer::rendered(content));
     }
@@ -4530,14 +4537,21 @@ impl GpuRenderer {
         dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
         gate: std::sync::Arc<cherenkov::WakeGate>,
     ) {
+        if self.pending_retire.remove(&id) {
+            return;
+        }
         self.producers
             .insert(id, gpu_content::Producer::submitted(dirty, gate));
     }
 
     /// Retires a producer: its last handle dropped, so no binding of it
-    /// remains — only its device resources are still registered.
+    /// remains — only its device resources are still registered. A
+    /// retirement that beat its producer's registration to this thread
+    /// is remembered: the add lands already retired.
     pub fn retire_gpu_producer(&mut self, id: ProducerId) {
-        self.producers.remove(&id);
+        if self.producers.remove(&id).is_none() {
+            self.pending_retire.insert(id);
+        }
     }
 
     /// Binds a layer on `surface` to `producer` at the size the layer
@@ -4555,7 +4569,6 @@ impl GpuRenderer {
         state.layers.remove(&layer);
         Self::unbind_producer(
             state,
-            &mut self.producers,
             &self.device,
             self.images_gen,
             self.atlas.mask_texture_generation(),
@@ -4572,13 +4585,11 @@ impl GpuRenderer {
     }
 
     /// Releases `layer`'s binding, if any: the bind groups sampling the
-    /// producer's current frame retire. A binding that held the
-    /// producer's last reference retires it inline — the drop is
-    /// already inside the transaction stream, so the retirement need
-    /// not round-trip the retire message back to this thread.
+    /// producer's current frame retire. A drop that held the producer's
+    /// last reference posts its retirement onto the producer's own
+    /// queue — it never blocks this thread on the channel it drains.
     fn unbind_producer(
         state: &mut SurfaceState,
-        producers: &mut FxHashMap<ProducerId, gpu_content::Producer>,
         device: &wgpu::Device,
         images_gen: u64,
         mask_gen: u64,
@@ -4599,9 +4610,6 @@ impl GpuRenderer {
             "producer unbound",
             |key| key.2 == Some(lower::ImageSource::Content(id)),
         );
-        if binding.is_last() {
-            producers.remove(&id);
-        }
     }
 
     /// Detaches every live producer and drops its device resources —

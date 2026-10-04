@@ -86,6 +86,7 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
         },
     );
     let redraw = content.redraw_handle();
+    let producer = engine.gpu_producer(content);
     send.send(wgpu::Color::RED)?;
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
@@ -93,7 +94,7 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
             .transform(Affine::translate((4.0, 4.0)))
             .clip(Rect::new(0.0, 0.0, 4.0, 4.0))
             .opacity(0.5_f32)
-            .content(engine.gpu_content((8, 8), content));
+            .content(producer.at((8, 8)));
     });
     assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(setups.load(Ordering::Relaxed), 1);
@@ -125,7 +126,8 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
     assert!((pixels[5 * 16 + 5][1] - 0.5).abs() < 0.001);
     send.send(wgpu::Color::BLUE)?;
     surface.update(|tx| {
-        tx[&layer].gpu_content_size((4, 4));
+        // A size change is a new binding of the same producer.
+        tx[&layer].content(producer.at((4, 4)));
     });
     wait!(engine.render(FrameTime::now()))?;
     assert_eq!(setups.load(Ordering::Relaxed), 1, "resize preserves setup");
@@ -159,7 +161,11 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
         "reattach consumes the pending update"
     );
     drop(layer);
+    drop(producer);
     wait!(engine.render(FrameTime::now()))?;
+    // The last drop retires through the transaction stream: the retire
+    // message lands behind the remove.
+    let _ = wait!(engine.memory());
     assert_eq!(drops.load(Ordering::Relaxed), 1);
     Ok(())
 }
@@ -203,7 +209,7 @@ fn hidden_surface_pulls_no_content_and_shows_current_state()
     send.send(wgpu::Color::RED)?;
     surface.update(|tx| {
         tx[surface.root()].push(&producer_layer).push(&fill_layer);
-        tx[&producer_layer].content(engine.gpu_content((8, 8), content));
+        tx[&producer_layer].content(engine.gpu_producer(content).at((8, 8)));
         tx[&fill_layer].content(recorded);
     });
     assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
@@ -337,18 +343,16 @@ use cherenkov::Instant;
         wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16).rate(30..=120)))?;
     let (adapter, adapters) = mpsc::channel();
     let (samples, times) = mpsc::channel();
+    let producer = engine.gpu_producer(GpuContentBox::new(
+        TimedProducer {
+            adapter,
+            samples,
+            first: true,
+        },
+        || {},
+    ));
     surface.update(|tx| {
-        tx[surface.root()].content(engine.gpu_content(
-            (8, 8),
-            GpuContentBox::new(
-                TimedProducer {
-                    adapter,
-                    samples,
-                    first: true,
-                },
-                || {},
-            ),
-        ));
+        tx[surface.root()].content(producer.at((8, 8)));
     });
     let start = Instant::now();
     let Next::At { rate, .. } = wait!(engine.render(FrameTime::at(start)))? else {
@@ -377,7 +381,8 @@ use cherenkov::Instant;
     assert_eq!(third.delta, Duration::from_millis(250));
     assert_eq!(third.scale.to_bits(), 2.0_f32.to_bits());
     surface.update(|tx| {
-        tx[surface.root()].gpu_content_size((4, 4));
+        // A size change is a new binding of the same producer.
+        tx[surface.root()].content(producer.at((4, 4)));
     });
     wait!(engine.render(FrameTime::at(start + Duration::from_millis(750))))?;
     let resized = times.try_recv()?;
@@ -512,7 +517,7 @@ fn hidden_wakes_stop_before_the_render_thread_applies_the_hide()
         tx[surface.root()]
             .push(&producer_layer)
             .push(&filtered_layer);
-        tx[&producer_layer].content(engine.gpu_content((8, 8), content));
+        tx[&producer_layer].content(engine.gpu_producer(content).at((8, 8)));
         tx[&filtered_layer].filter(&effect).content(
             surface.record(|c| c.fill(Rect::new(8.0, 8.0, 16.0, 16.0), WorkingColor::WHITE)),
         );
@@ -568,4 +573,251 @@ fn hidden_wakes_stop_before_the_render_thread_applies_the_hide()
         "a shown surface's filter wakes the host again"
     );
     Ok(())
+}
+
+split_test! {
+/// A producer bound on two surfaces of one engine draws real pixels on
+/// both from one shared attachment and one setup — the renderer folds the
+/// frame's drawn bindings across surfaces (#268).
+fn one_setup_serves_bindings_on_two_surfaces() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let first = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let second = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let first_layer = first.layer();
+    let second_layer = second.layer();
+    let setups = Arc::new(AtomicUsize::new(0));
+    let frames = Arc::new(AtomicUsize::new(0));
+    let (send, colors) = mpsc::channel();
+    let producer = engine.gpu_producer(GpuContentBox::new(
+        Producer {
+            colors,
+            setups: setups.clone(),
+            frames: frames.clone(),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        || {},
+    ));
+    send.send(wgpu::Color::RED)?;
+    first.update(|tx| {
+        tx[first.root()].push(&first_layer);
+        tx[&first_layer].content(producer.at((8, 8)));
+    });
+    second.update(|tx| {
+        tx[second.root()].push(&second_layer);
+        tx[&second_layer].content(producer.at((8, 8)));
+    });
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
+    assert_eq!(
+        setups.load(Ordering::Relaxed),
+        1,
+        "one setup serves bindings on both surfaces"
+    );
+    assert_eq!(
+        frames.load(Ordering::Relaxed),
+        1,
+        "one render serves bindings on both surfaces"
+    );
+    let pixels = wait!(first.readback())?.pixels;
+    assert!(
+        (pixels[4 * 16 + 4][0] - 1.0).abs() < 0.001,
+        "first surface draws the shared attachment: {:?}",
+        pixels[4 * 16 + 4]
+    );
+    let pixels = wait!(second.readback())?.pixels;
+    assert!(
+        (pixels[4 * 16 + 4][0] - 1.0).abs() < 0.001,
+        "second surface draws the shared attachment: {:?}",
+        pixels[4 * 16 + 4]
+    );
+    Ok(())
+}
+}
+
+split_test! {
+/// Bindings at two output sizes size the one output attachment to the
+/// componentwise larger request — the producer's frame reports it — and a
+/// later change resizes the attachment without another setup (#268).
+fn bindings_size_the_attachment_to_the_larger() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let first = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let second = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let first_layer = first.layer();
+    let second_layer = second.layer();
+    let (adapter, adapters) = mpsc::channel();
+    let (samples, times) = mpsc::channel();
+    let producer = engine.gpu_producer(GpuContentBox::new(
+        TimedProducer {
+            adapter,
+            samples,
+            first: false,
+        },
+        || {},
+    ));
+    first.update(|tx| {
+        tx[first.root()].push(&first_layer);
+        tx[&first_layer].content(producer.at((4, 4)));
+    });
+    second.update(|tx| {
+        tx[second.root()].push(&second_layer);
+        tx[&second_layer].content(producer.at((8, 8)));
+    });
+    wait!(engine.render(FrameTime::now()))?;
+    adapters.try_recv()?;
+    assert_eq!(
+        times.try_recv()?.size,
+        (8, 8),
+        "the attachment is the largest binding's size"
+    );
+    assert!(
+        times.try_recv().is_err(),
+        "one render serves bindings at both sizes"
+    );
+    second.update(|tx| {
+        tx[&second_layer].content(producer.at((12, 12)));
+    });
+    wait!(engine.render(FrameTime::now()))?;
+    assert_eq!(
+        times.try_recv()?.size,
+        (12, 12),
+        "a size change resizes the attachment"
+    );
+    assert!(
+        adapters.try_recv().is_err(),
+        "an attachment resize runs no further setup"
+    );
+    Ok(())
+}
+}
+
+split_test! {
+/// A device replacement drains every producer out of the old renderer:
+/// re-registered on the new engine, the producer runs setup exactly once
+/// more and renders again on the new device (#268).
+fn device_replacement_rebuilds_the_producer_with_one_more_setup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let layer = surface.layer();
+    let setups = Arc::new(AtomicUsize::new(0));
+    let frames = Arc::new(AtomicUsize::new(0));
+    let (send, colors) = mpsc::channel();
+    let producer = engine.gpu_producer(GpuContentBox::new(
+        Producer {
+            colors,
+            setups: setups.clone(),
+            frames: frames.clone(),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        || {},
+    ));
+    send.send(wgpu::Color::RED)?;
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+        tx[&layer].content(producer.at((8, 8)));
+    });
+    wait!(engine.render(FrameTime::now()))?;
+    assert_eq!(setups.load(Ordering::Relaxed), 1);
+    assert_eq!(frames.load(Ordering::Relaxed), 1);
+
+    // The old renderer drops the producers' device resources and hands
+    // their content back; the new engine registers and binds them again.
+    let contents = wait!(engine.drain_gpu_producers())?;
+    let [(_id, drained)] =
+        <[_; 1]>::try_from(contents).unwrap_or_else(|_| panic!("one live producer"));
+    let cherenkov::DrainedProducer::Rendered(content) = drained else {
+        panic!("a rendered producer drains its content")
+    };
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let layer = surface.layer();
+    let producer = engine.gpu_producer(content);
+    send.send(wgpu::Color::GREEN)?;
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+        tx[&layer].content(producer.at((8, 8)));
+    });
+    wait!(engine.render(FrameTime::now()))?;
+    assert_eq!(
+        setups.load(Ordering::Relaxed),
+        2,
+        "exactly one more setup on the new device"
+    );
+    assert_eq!(
+        frames.load(Ordering::Relaxed),
+        2,
+        "the producer renders again after the replacement"
+    );
+    let pixels = wait!(surface.readback())?.pixels;
+    assert!(
+        (pixels[4 * 16 + 4][1] - 1.0).abs() < 0.001,
+        "fresh pixels on the new device: {:?}",
+        pixels[4 * 16 + 4]
+    );
+    Ok(())
+}
+}
+
+split_test! {
+/// A producer whose first binding sits on the transient capture target
+/// renders there — setup runs on the first drawn binding wherever it is —
+/// and keeps its attachment when the transient surface is destroyed while
+/// a binding on the persistent surface still draws it (#268).
+fn capture_first_producer_renders_on_the_transient_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let persistent = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let transient = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let transient_layer = transient.layer();
+    let persistent_layer = persistent.layer();
+    let setups = Arc::new(AtomicUsize::new(0));
+    let frames = Arc::new(AtomicUsize::new(0));
+    let (send, colors) = mpsc::channel();
+    let producer = engine.gpu_producer(GpuContentBox::new(
+        Producer {
+            colors,
+            setups: setups.clone(),
+            frames: frames.clone(),
+            drops: Arc::new(AtomicUsize::new(0)),
+        },
+        || {},
+    ));
+    send.send(wgpu::Color::RED)?;
+    transient.update(|tx| {
+        tx[transient.root()].push(&transient_layer);
+        tx[&transient_layer].content(producer.at((8, 8)));
+    });
+    wait!(engine.render(FrameTime::now()))?;
+    assert_eq!(
+        setups.load(Ordering::Relaxed),
+        1,
+        "setup runs on the first drawn binding, transient or not"
+    );
+    assert_eq!(frames.load(Ordering::Relaxed), 1);
+    let pixels = wait!(transient.readback())?.pixels;
+    assert!(
+        (pixels[4 * 16 + 4][0] - 1.0).abs() < 0.001,
+        "the capture target draws real pixels: {:?}",
+        pixels[4 * 16 + 4]
+    );
+
+    persistent.update(|tx| {
+        tx[persistent.root()].push(&persistent_layer);
+        tx[&persistent_layer].content(producer.at((8, 8)));
+    });
+    drop(transient);
+    wait!(engine.render(FrameTime::now()))?;
+    assert_eq!(setups.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        frames.load(Ordering::Relaxed),
+        1,
+        "the persistent binding samples the one live attachment"
+    );
+    let pixels = wait!(persistent.readback())?.pixels;
+    assert!(
+        (pixels[4 * 16 + 4][0] - 1.0).abs() < 0.001,
+        "the shared attachment survives the capture target: {:?}",
+        pixels[4 * 16 + 4]
+    );
+    Ok(())
+}
 }

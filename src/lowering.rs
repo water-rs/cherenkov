@@ -1955,6 +1955,7 @@ mod tests {
 #[cfg(test)]
 mod content_tests {
     use super::{Content, Operation};
+    use crate::Draw;
 
     struct TestOp;
 
@@ -1970,8 +1971,13 @@ mod content_tests {
 
     #[test]
     fn replacement_returns_the_previous_picture() {
-        let previous = crate::Picture::new(crate::DisplayList::default());
-        let replacement = crate::Picture::new(crate::DisplayList::with_capacity(2));
+        let previous = crate::Picture::from_list(crate::DisplayList::default());
+        let replacement = crate::Picture::record(|c| {
+            c.fill(
+                crate::kurbo::Rect::new(0., 0., 1., 1.),
+                crate::WorkingColor::WHITE,
+            );
+        });
         let mut content = Content::<TestOp, ()>::new(previous.clone());
 
         assert_eq!(content.replace(replacement.clone()), previous);

@@ -369,3 +369,183 @@ impl BackdropShader {
         }
     }
 }
+
+/// The channel a [`GpuProducer`]'s last drop posts its retirement through.
+#[cfg(not(target_arch = "wasm32"))]
+type ProducerChannel<B> = std::sync::mpsc::SyncSender<crate::message::Message<B>>;
+#[cfg(target_arch = "wasm32")]
+type ProducerChannel<B> = crate::local::Sender<crate::message::Message<B>>;
+
+/// The wake callback a [`FrameSink`] fires: thread-safe on native, on the
+/// owning JS thread on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
+type SinkWake = Arc<dyn Fn() + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+type SinkWake = std::rc::Rc<dyn Fn()>;
+
+/// What a [`GpuProducer`] shares with the copies its binding holds on the
+/// render thread: the last `Arc` drop — handle or binding — retires the
+/// producer through the transaction stream.
+struct ProducerShared<B: crate::GpuContent> {
+    id: crate::message::ProducerId,
+    tx: ProducerChannel<B>,
+}
+
+impl<B: crate::GpuContent> Drop for ProducerShared<B> {
+    fn drop(&mut self) {
+        let id = self.id;
+        // A lost render loop leaves nothing to retire.
+        let _ = self.tx.send(crate::message::Message::Resource(Box::new(
+            move |r: &mut B::Renderer| {
+                B::retire_gpu_producer(r, id);
+            },
+        )));
+    }
+}
+
+/// A GPU producer shared across the surfaces of one engine, created by
+/// [`Engine::gpu_producer`](crate::Engine::gpu_producer).
+///
+/// The one view instance owns a handle; `Clone`s share the producer's
+/// renderer state. [`at`](Self::at) binds it to a layer at the pixel size
+/// that layer needs — any number of the engine's surfaces may bind it, a
+/// persistent one and a transient capture target alike; the layout, clip
+/// and transform stay the layer's own. There is no cache keyed by content:
+/// a second `gpu_producer` call is a second producer.
+///
+/// The renderer renders the producer's output attachment at most once per
+/// frame, sized to the componentwise largest attachment its drawn bindings
+/// requested, and every binding samples `ImageSource::Content` of the
+/// producer's [`id`](Self::id). Dropping the last handle retires the
+/// producer through the transaction stream.
+pub struct GpuProducer<B: crate::GpuContent> {
+    shared: Arc<ProducerShared<B>>,
+}
+
+impl<B: crate::GpuContent> std::fmt::Debug for GpuProducer<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuProducer")
+            .field("id", &self.id())
+            .finish()
+    }
+}
+
+impl<B: crate::GpuContent> Clone for GpuProducer<B> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<B: crate::GpuContent> GpuProducer<B> {
+    pub(crate) fn new(id: crate::message::ProducerId, tx: ProducerChannel<B>) -> Self {
+        Self {
+            shared: Arc::new(ProducerShared { id, tx }),
+        }
+    }
+
+    /// The producer's identifier: what every binding's
+    /// `ImageSource::Content` names.
+    #[must_use]
+    pub fn id(&self) -> crate::message::ProducerId {
+        self.shared.id
+    }
+
+    /// `true` when this handle is the producer's last reference — the
+    /// drop it belongs to is the retirement. The renderer asks this of
+    /// a dying binding so a last drop inside the transaction stream
+    /// retires the producer's resources inline rather than
+    /// round-tripping the retirement back to itself.
+    #[must_use]
+    pub fn is_last(&self) -> bool {
+        Arc::strong_count(&self.shared) == 1
+    }
+
+    /// Binds the producer to a layer at `size` pixels — the pixel size
+    /// that layer needs. Returns the layer content
+    /// [`LayerEdit::content`](crate::LayerEdit::content) installs; binding
+    /// the layer again is a new binding.
+    ///
+    /// # Panics
+    /// At apply time, when the producer is bound on an engine other than
+    /// the one that made it.
+    #[must_use]
+    pub fn at(&self, size: (u32, u32)) -> crate::surface::LayerContent<B> {
+        let producer = self.clone();
+        crate::surface::LayerContent::Install(Box::new(move |r, surface, layer| {
+            B::bind_gpu_producer(r, surface, layer, &producer, size);
+        }))
+    }
+}
+
+/// The input end of a submitted-frame producer, created by
+/// [`Engine::frame_producer`](crate::Engine::frame_producer) together with
+/// its [`GpuProducer`].
+///
+/// [`submit`](Self::submit) installs the frame as the producer's current
+/// frame — the one every binding samples — and wakes the host while any
+/// binding is drawn on a visible surface. The sink is `Send`: a decoder
+/// thread may submit while the bindings stay on the engine's surfaces.
+///
+/// A frame producer has no setup: a device replacement drops its frame
+/// with the old renderer, and the next `submit` supplies the first frame
+/// on the new device
+/// ([`drain_gpu_producers`](crate::GpuContent::drain_gpu_producers) is the
+/// device-replacement contract).
+pub struct FrameSink<B: crate::GpuContent> {
+    tx: ProducerChannel<B>,
+    id: crate::message::ProducerId,
+    /// Set on each submit; the render loop clears it once a frame draws
+    /// the producer.
+    dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// Open while any binding is drawn on a visible surface.
+    gate: Arc<crate::WakeGate>,
+    /// The engine's host wake-up.
+    wake: SinkWake,
+}
+
+impl<B: crate::GpuContent> std::fmt::Debug for FrameSink<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameSink")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B: crate::GpuContent> FrameSink<B> {
+    pub(crate) fn new(
+        id: crate::message::ProducerId,
+        tx: ProducerChannel<B>,
+        dirty: Arc<std::sync::atomic::AtomicBool>,
+        gate: Arc<crate::WakeGate>,
+        wake: SinkWake,
+    ) -> Self {
+        Self {
+            tx,
+            id,
+            dirty,
+            gate,
+            wake,
+        }
+    }
+
+    /// Installs `frame` as the producer's current frame. The submit
+    /// travels in order with the engine's messages; each surface a
+    /// binding of the producer is drawn on treats it as the layer's frame
+    /// swap. Wakes the host once per new frame while the producer is on a
+    /// visible surface — submits coalesce like a producer's redraw.
+    pub fn submit(&self, frame: impl Into<B::Frame>) {
+        let frame = frame.into();
+        let opaque = B::frame_opaque(&frame);
+        let id = self.id;
+        let _ = self.tx.send(crate::message::Message::ProducerFrame {
+            producer: id,
+            opaque,
+            apply: Box::new(move |r| B::submit_frame(r, id, frame)),
+        });
+        if !self.dirty.swap(true, std::sync::atomic::Ordering::AcqRel) && self.gate.is_open() {
+            (self.wake)();
+        }
+    }
+}

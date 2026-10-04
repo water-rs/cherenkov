@@ -60,7 +60,7 @@ pub use crate::backend::{
     Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo, Visibility,
 };
 pub use crate::capability::{
-    Backdrop, BackdropChain, BackdropRuns, BackdropShaders, Effects, ExternalFrames, Filters,
+    Backdrop, BackdropChain, BackdropRuns, BackdropShaders, DrainedProducer, Effects, Filters,
     GpuContent, HdrOutput, Planes, ProjectiveLayers, Runs, ShaderPaint as ShaderPaintCapability,
     ShaderSource, Uploads,
 };
@@ -85,26 +85,27 @@ pub use crate::image::{
     Astc4x4, Bc7, Etc2Rgba, Format, ImageColorSpace, ImageData, ImageFormat, ImageUpload, Rgba8,
     Rgba16F,
 };
-pub use crate::message::{BackdropId, ContentOp, FontData, LayerId, Prop, SurfaceId};
+pub use crate::message::{BackdropId, ContentOp, FontData, LayerId, ProducerId, Prop, SurfaceId};
 pub use crate::paint::{
     ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient,
     MeshColorInterpolation, MeshGradient, MeshGradientError, Paint, RadialGradient, Sampling,
     ShaderId, ShaderPaint, SweepGradient, TransformedPaint,
 };
 pub use crate::projective::{Projective, ProjectiveError};
-pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
+pub use crate::record::{
+    Animating, Binding, Content, ContentChange, ContentSpare, Draw, Fixed, Live, LiveOwner,
+    Recorder, SampleFlag, StaticRecorder,
+};
 pub use crate::resource::{
-    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, Shader,
+    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, FrameSink,
+    GpuProducer, Image, Shader,
 };
 pub use crate::shape::{
     ContinuousRect, EvenOdd, FillRule, PATH_TOLERANCE, PathRef, Semantic, Shape, ShapeData,
 };
 pub use crate::size::LayoutSize;
 pub use crate::style::{BlendMode, BlendSpace, FilterId, Group, Shadow};
-pub use crate::surface::{
-    ExternalFrameHandle, ExternalFrameInstall, GpuContentHandle, Layer, LayerContent, LayerEdit,
-    Surface, Transaction,
-};
+pub use crate::surface::{Layer, LayerContent, LayerEdit, Surface, Transaction};
 pub use crate::text::{TextLayout, draw_text};
 pub use crate::tree::{LayerAnimations, LayerNode, SurfaceTree, snap_animating};
 pub use cherenkov_record::BackdropShaderId;

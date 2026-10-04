@@ -1047,22 +1047,21 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
         .checked_mul(3)
         .ok_or_else(|| BenchError::Gpu("external-cost: query count overflows".into()))?;
 
+    let (video, sink) = engine.frame_producer();
     let copy = match path {
         ExternalPath::External => {
             surface.update(|tx| {
                 tx[surface.root()].push(&layer);
+                tx[&layer].content(video.at((spec.width, spec.height)));
             });
             None
         }
         ExternalPath::Copy => {
             let copy = CopyPath::new(&shared, &spec, query_count)?;
-            let handle = engine.gpu_content(
-                (spec.width, spec.height),
-                GpuContentBox::new(copy.converter(), || {}),
-            );
+            let producer = engine.gpu_producer(GpuContentBox::new(copy.converter(), || {}));
             surface.update(|tx| {
                 tx[surface.root()].push(&layer);
-                tx[&layer].content(handle);
+                tx[&layer].content(producer.at((spec.width, spec.height)));
             });
             Some(copy)
         }
@@ -1117,10 +1116,7 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
                 } else {
                     import_form = Some(form);
                 }
-                let handle = engine.external_frame(external);
-                surface.update(|tx| {
-                    tx[&layer].content(handle);
-                });
+                sink.submit(external);
             }
             ExternalPath::Copy => {
                 copy.as_ref()
@@ -1319,21 +1315,19 @@ pub fn composite_frame(
     match path {
         ExternalPath::External => {
             let (external, _) = producer.external(frame, spec.color)?;
-            let handle = engine.external_frame(external);
+            let (video, sink) = engine.frame_producer();
+            sink.submit(external);
             surface.update(|tx| {
                 tx[surface.root()].push(&layer);
-                tx[&layer].content(handle);
+                tx[&layer].content(video.at((spec.width, spec.height)));
             });
         }
         ExternalPath::Copy => {
             let copy = CopyPath::new(&shared, &spec, 3)?;
-            let handle = engine.gpu_content(
-                (spec.width, spec.height),
-                GpuContentBox::new(copy.converter(), || {}),
-            );
+            let gpu = engine.gpu_producer(GpuContentBox::new(copy.converter(), || {}));
             surface.update(|tx| {
                 tx[surface.root()].push(&layer);
-                tx[&layer].content(handle);
+                tx[&layer].content(gpu.at((spec.width, spec.height)));
             });
             copy.stage(&producer, frame, &shared)?;
         }

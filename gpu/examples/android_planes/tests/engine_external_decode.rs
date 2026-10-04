@@ -115,12 +115,13 @@ fn the_engine_decodes_the_nv12_pattern() {
         .surface(Offscreen::new((sw, sh), OffscreenFormat::LinearF16))
         .expect("offscreen surface");
     let video = surface.layer();
-    let handle = engine.external_frame(frame);
+    let (prod, sink) = engine.frame_producer();
+    sink.submit(frame);
     surface.update(|tx| {
         tx[surface.root()].push(&video);
         // The full frame covers the surface: 1920x1080 scaled by 0.25.
         tx[&video].transform(Affine::scale(0.25));
-        tx[&video].content(handle);
+        tx[&video].content(prod.at((1920, 1080)));
     });
     engine.render(FrameTime::now()).expect("frame renders");
     let read = surface.readback().expect("readable surface");

@@ -43,7 +43,8 @@ mod macos {
         RawWindowHandle, WindowHandle,
     };
     use cherenkov_gpu::interop::{
-        ExternalFrame, FrameColor, RgbAlpha, SharedDevice, YuvRange, metal::import_texture, wgpu,
+        ExternalFrame, FrameColor, GpuContent, GpuContentBox, RgbAlpha, SharedDevice, YuvRange,
+        metal::import_texture, wgpu,
     };
     use cherenkov_gpu::{DisplaySync, Gpu, GpuConfig, WindowTarget};
     use dispatch2::DispatchQueue;
@@ -130,6 +131,10 @@ mod macos {
             case(
                 "promoted_composition_matches_engine_composition",
                 promoted_composition_matches_engine_composition,
+            ),
+            case(
+                "a_rendered_producer_promotes_and_matches_composited",
+                a_rendered_producer_promotes_and_matches_composited,
             ),
             case(
                 "a_bt709_frame_stays_in_the_engine_and_matches",
@@ -829,7 +834,8 @@ mod macos {
         let bar = surface.record(|c| {
             c.fill(bar_rect, WorkingColor::new([0.5, 0.5, 0.5, bar_alpha]));
         });
-        let video = engine.external_frame(frame);
+        let (video, sink) = engine.frame_producer();
+        sink.submit(frame);
         surface.update(|tx| {
             tx[surface.root()].push(&below).push(&holder).push(&above);
             tx[&below].content(backdrop);
@@ -837,7 +843,9 @@ mod macos {
                 .push(&player)
                 .transform(Affine::translate((12.0, 8.0)))
                 .clip(RoundedRect::new(0.0, 0.0, 72.0, 48.0, 6.0));
-            tx[&player].transform(Affine::scale(1.5)).content(video);
+            tx[&player]
+                .transform(Affine::scale(1.5))
+                .content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
             tx[&above].content(bar).clip(bar_rect);
         });
         [below, holder, player, above]
@@ -1293,12 +1301,11 @@ mod macos {
         let fixture = Fixture::new();
         let buffer = bgra_buffer();
         let video = fixture.window.layer();
-        let frame = fixture
-            .engine
-            .external_frame(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
+        let (video_prod, sink) = fixture.engine.frame_producer();
+        sink.submit(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
         fixture.window.update(|tx| {
             tx[fixture.window.root()].push(&video);
-            tx[&video].content(frame);
+            tx[&video].content(video_prod.at((VIDEO.0 as u32, VIDEO.1 as u32)));
         });
         assert!(
             fixture.promote(),
@@ -1331,13 +1338,7 @@ mod macos {
         assert_eq!(node.position(), CGPoint::new(24., 16.));
         // A new video frame and a full present-only compose must leave
         // the compositor-owned affine/position pair intact.
-        let replacement =
-            fixture
-                .engine
-                .external_frame(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
-        fixture.window.update(|tx| {
-            tx[&video].content(replacement);
-        });
+        sink.submit(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
         fixture.render();
         assert_eq!(node.position(), CGPoint::new(24., 16.));
         assert_eq!(node.affineTransform().tx, 0.0);
@@ -1432,6 +1433,76 @@ mod macos {
         // The parity holds either way: a host that never reports the
         // probe ready shows the engine's own composition in the window.
         engine_parity(&fixture, &offscreen, "promoted");
+    }
+
+    /// Clears the producer's frame to one opaque colour — the pixels a
+    /// promoted plane and the engine's own quad both sample.
+    struct Clearing(wgpu::Color);
+
+    impl GpuContent for Clearing {
+        async fn setup(&mut self, _: &wgpu::Context<'_>) {}
+
+        fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
+            let mut encoder = frame
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.0),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            drop(pass);
+            frame.queue.submit([encoder.finish()]);
+        }
+    }
+
+    /// A rendered producer — `Engine::gpu_producer` — on an eligible
+    /// layer promotes like a submitted frame: the plan names its binding
+    /// (one display layer under the root), and the system's composition
+    /// of the promoted stack matches the engine's own, the ring frame's
+    /// declared linear-P3 decode being the identity.
+    fn a_rendered_producer_promotes_and_matches_composited() {
+        let fixture = Fixture::new();
+        let video = fixture.engine.gpu_producer(GpuContentBox::new(
+            Clearing(wgpu::Color {
+                r: 0.25,
+                g: 0.5,
+                b: 0.2,
+                a: 1.0,
+            }),
+            || {},
+        ));
+        let layer = |surface: &Surface<Gpu>| {
+            let layer = surface.layer();
+            surface.update(|tx| {
+                tx[surface.root()].push(&layer);
+                tx[&layer].content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
+            });
+            layer
+        };
+        let _window_layer = layer(&fixture.window);
+        let offscreen = fixture
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let _offscreen_layer = layer(&offscreen);
+        if fixture.promote() {
+            assert_eq!(
+                displays(&fixture.root()).len(),
+                1,
+                "the plan names the producer's binding"
+            );
+        }
+        // The parity holds either way: a host that never reports the
+        // probe ready shows the engine's own composition in the window.
+        engine_parity(&fixture, &offscreen, "promoted rendered producer");
     }
 
     /// The pixels a window and an offscreen engine surface produce from
@@ -1530,8 +1601,8 @@ mod macos {
     fn a_promoted_layer_painted_last_composes() {
         let fixture = Fixture::new();
         let buffer = bgra_buffer();
-        let frame = bgra(&fixture.metal, &buffer, FrameColor::SRGB);
-        let video = fixture.engine.external_frame(frame);
+        let (video, sink) = fixture.engine.frame_producer();
+        sink.submit(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
         let layer = fixture.window.layer();
         fixture.window.update(|tx| {
             tx[fixture.window.root()].push(&layer);
@@ -1539,7 +1610,7 @@ mod macos {
                 .transform(Affine::scale(
                     f64::from(SIZE.0) / f64::from(u32::try_from(VIDEO.0).expect("fits")),
                 ))
-                .content(video);
+                .content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
         });
         assert!(
             fixture.promote(),
@@ -1563,8 +1634,8 @@ mod macos {
         let fixture = Fixture::new();
         let layer = |x: f64| {
             let buffer = bgra_buffer();
-            let frame = bgra(&fixture.metal, &buffer, FrameColor::SRGB);
-            let video = fixture.engine.external_frame(frame);
+            let (video, sink) = fixture.engine.frame_producer();
+            sink.submit(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
             let layer = fixture.window.layer();
             fixture.window.update(|tx| {
                 tx[fixture.window.root()].push(&layer);
@@ -1576,7 +1647,7 @@ mod macos {
                                     / f64::from(u32::try_from(VIDEO.0).expect("fits")),
                             ),
                     )
-                    .content(video);
+                    .content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
             });
             layer
         };

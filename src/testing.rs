@@ -50,8 +50,17 @@ pub enum Event {
     RemoveShader(ShaderId),
     /// `set_content` ran.
     SetContent(SurfaceId, LayerId),
-    /// `set_external_frame` ran.
-    ExternalFrame(SurfaceId, LayerId),
+    /// `set_external_frame`-equivalent: a submitted frame landed on a
+    /// bound layer.
+    ProducerFrame(SurfaceId, LayerId),
+    /// `add_gpu_producer` or `add_frame_producer` ran.
+    AddProducer(crate::ProducerId),
+    /// `bind_gpu_producer` ran, with the binding's producer.
+    BindProducer(SurfaceId, LayerId, crate::ProducerId),
+    /// `retire_gpu_producer` ran.
+    RetireProducer(crate::ProducerId),
+    /// `drain_gpu_producers` ran.
+    DrainProducers,
     /// `remove_layer` ran.
     RemoveLayer(SurfaceId, LayerId),
     /// `set_visibility` ran.
@@ -166,9 +175,26 @@ pub struct NullRenderer {
     pictures: FxHashMap<(SurfaceId, LayerId), Picture>,
     /// Every resource removed so far; ids are never reused.
     removed: HashSet<ResourceId>,
+    /// The producers, so `submit_frame` names their bound layers.
+    producers: FxHashMap<crate::ProducerId, NullProducer>,
+}
+
+/// A [`Null`] producer: rendered (`content` `Some`) or submitted-frame.
+struct NullProducer {
+    content: Option<()>,
+    bindings: HashSet<(SurfaceId, LayerId)>,
 }
 
 impl NullRenderer {
+    /// Releases the binding every producer holds on `(surface, layer)`,
+    /// like `set_content` and `remove_layer` dropping the layer's other
+    /// content.
+    fn unbind(&mut self, surface: SurfaceId, layer: LayerId) {
+        for producer in self.producers.values_mut() {
+            producer.bindings.remove(&(surface, layer));
+        }
+    }
+
     fn new(config: NullConfig) -> Self {
         Self {
             events: config.events,
@@ -180,6 +206,7 @@ impl NullRenderer {
             shaders: HashSet::new(),
             pictures: FxHashMap::default(),
             removed: HashSet::new(),
+            producers: FxHashMap::default(),
         }
     }
 
@@ -359,12 +386,14 @@ impl Renderer for NullRenderer {
             }
             None => self.pictures.remove(&(surface, layer)),
         };
+        self.unbind(surface, layer);
         let _ = self.events.send(Event::SetContent(surface, layer));
         previous
     }
 
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId) {
         self.pictures.remove(&(surface, layer));
+        self.unbind(surface, layer);
         let _ = self.events.send(Event::RemoveLayer(surface, layer));
     }
 
@@ -518,18 +547,101 @@ impl ShaderPaint for Null {
 impl Uploads<Rgba8> for Null {}
 impl Uploads<Rgba16F> for Null {}
 
-/// `Null` retains no frame: the install is reported and the `()` frame
-/// drops. `external_frame`/`content` still exercise the render loop's
-/// plane-eligible change tracking (#90).
-impl crate::ExternalFrames for Null {
+/// `Null` retains no producer state beyond the bindings `submit_frame`
+/// needs to name its layers — enough for `frame_producer` to exercise the
+/// render loop's plane-eligible change tracking (#90).
+impl crate::GpuContent for Null {
+    type Content = ();
     type Frame = ();
 
     fn frame_opaque(_frame: &()) -> bool {
         false
     }
 
-    fn set_external_frame(r: &mut NullRenderer, surface: SurfaceId, layer: LayerId, _frame: ()) {
-        let _ = r.events.send(Event::ExternalFrame(surface, layer));
+    fn add_gpu_producer(r: &mut NullRenderer, id: crate::ProducerId, _content: ()) {
+        r.producers.insert(
+            id,
+            NullProducer {
+                content: Some(()),
+                bindings: HashSet::new(),
+            },
+        );
+        let _ = r.events.send(Event::AddProducer(id));
+    }
+
+    fn add_frame_producer(
+        r: &mut NullRenderer,
+        id: crate::ProducerId,
+        _dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _gate: std::sync::Arc<crate::WakeGate>,
+    ) {
+        r.producers.insert(
+            id,
+            NullProducer {
+                content: None,
+                bindings: HashSet::new(),
+            },
+        );
+        let _ = r.events.send(Event::AddProducer(id));
+    }
+
+    fn bind_gpu_producer(
+        r: &mut NullRenderer,
+        surface: SurfaceId,
+        layer: LayerId,
+        producer: &crate::GpuProducer<Self>,
+        _size: (u32, u32),
+    ) {
+        let Some(entry) = r.producers.get_mut(&producer.id()) else {
+            panic!("binding of an unknown producer {}", producer.id().raw());
+        };
+        entry.bindings.insert((surface, layer));
+        let _ = r
+            .events
+            .send(Event::BindProducer(surface, layer, producer.id()));
+    }
+
+    fn submit_frame(
+        r: &mut NullRenderer,
+        id: crate::ProducerId,
+        _frame: (),
+    ) -> Vec<(SurfaceId, LayerId)> {
+        let Some(producer) = r.producers.get_mut(&id) else {
+            panic!("submit to an unknown producer {}", id.raw());
+        };
+        let mut bound: Vec<_> = producer.bindings.iter().copied().collect();
+        bound.sort_by_key(|(surface, layer)| (surface.raw(), layer.raw()));
+        for &(surface, layer) in &bound {
+            let _ = r.events.send(Event::ProducerFrame(surface, layer));
+        }
+        bound
+    }
+
+    fn retire_gpu_producer(r: &mut NullRenderer, id: crate::ProducerId) {
+        assert!(
+            r.producers.remove(&id).is_some(),
+            "retirement of unregistered producer {}",
+            id.raw()
+        );
+        let _ = r.events.send(Event::RetireProducer(id));
+    }
+
+    fn drain_gpu_producers(
+        r: &mut NullRenderer,
+    ) -> Vec<(crate::ProducerId, crate::DrainedProducer<Self>)> {
+        let _ = r.events.send(Event::DrainProducers);
+        r.producers
+            .drain()
+            .map(|(id, producer)| {
+                (
+                    id,
+                    match producer.content {
+                        Some(()) => crate::DrainedProducer::Rendered(()),
+                        None => crate::DrainedProducer::Frame,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -1598,23 +1710,24 @@ mod tests {
         );
     }
 
-    /// A commit that only installs external frames reports the installed
+    /// A commit that only installs submitted frames reports the installed
     /// layers in the frame's `plane_frames`; a commit that changes anything
     /// else — a layer op, a content op — reports `None` (#90).
     #[test]
-    fn external_frame_only_commits_fill_plane_frames() {
+    fn frame_only_commits_fill_plane_frames() {
         let (engine, rx) = engine();
         let surface = engine
             .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
             .expect("surface");
         let video = surface.layer();
         let above = surface.layer();
+        let (producer, sink) = engine.frame_producer();
         // Creating and pushing the layers is an ordinary change, so the
-        // frame that also installs the first frame is not plane-only.
+        // frame that also binds the producer is not plane-only.
         surface.update(|tx| {
             tx[surface.root()].push(&video);
             tx[surface.root()].push(&above);
-            tx[&video].content(engine.external_frame(()));
+            tx[&video].content(producer.at((8, 8)));
         });
         engine.render(FrameTime::now()).expect("render");
         let record = frames(&rx).pop().expect("a frame record");
@@ -1625,29 +1738,28 @@ mod tests {
         );
 
         // A new frame on the layer alone is the frame's only change.
-        surface.update(|tx| {
-            tx[&video].content(engine.external_frame(()));
-        });
+        sink.submit(());
         engine.render(FrameTime::now()).expect("render");
         let record = frames(&rx).pop().expect("a frame record");
         assert!(record.changed);
         assert_eq!(record.plane_frames, Some(vec![video.id()]));
 
-        // Two layers' new frames commute to one set.
+        // Two bindings' new frames commute to one set.
         surface.update(|tx| {
-            tx[&video].content(engine.external_frame(()));
-            tx[&above].content(engine.external_frame(()));
+            tx[&above].content(producer.at((8, 8)));
         });
+        engine.render(FrameTime::now()).expect("render");
+        sink.submit(());
         engine.render(FrameTime::now()).expect("render");
         let record = frames(&rx).pop().expect("a frame record");
         assert!(record.changed);
         assert_eq!(record.plane_frames, Some(vec![video.id(), above.id()]));
 
-        // A frame installed alongside a layer op is an ordinary change.
+        // A frame submitted alongside a layer op is an ordinary change.
         surface.update(|tx| {
-            tx[&video].content(engine.external_frame(()));
             tx[&above].opacity(0.5f32);
         });
+        sink.submit(());
         engine.render(FrameTime::now()).expect("render");
         let record = frames(&rx).pop().expect("a frame record");
         assert!(record.changed);

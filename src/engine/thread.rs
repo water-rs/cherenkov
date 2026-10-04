@@ -374,6 +374,9 @@ pub fn run<B: Backend>(
                 set_visibility::<B>(&mut renderer, &mut surfaces, id, visibility);
             }
             Message::Resource(op) => op(&mut renderer),
+            Message::ProducerFrame { opaque, apply, .. } => {
+                producer_frame::<B>(&mut renderer, &mut surfaces, opaque, apply);
+            }
             Message::Register { resource, op } => {
                 resources.register(resource, op(&mut renderer));
             }
@@ -429,6 +432,25 @@ pub fn run<B: Backend>(
             }
             Message::Trim(pressure) => renderer.trim(pressure),
             Message::Shutdown => break,
+        }
+    }
+}
+
+/// The submitted frame applied on the renderer names the layers it lands
+/// on; each gets the frame's declared alpha contract noted and counts as
+/// a frame swap — a planes-capable backend presents those alone when they
+/// are the surface's only change (#90).
+fn producer_frame<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    opaque: bool,
+    apply: crate::message::ProducerApply<B>,
+) {
+    for (surface, layer) in apply(renderer) {
+        if let Some(state) = surfaces.get_mut(&surface) {
+            state.tree.note_installed(layer, opaque);
+            state.commits = state.commits.max(Commits::Installs);
+            state.plane_frames.insert(layer);
         }
     }
 }
@@ -635,7 +657,7 @@ fn commit<B: Backend>(
                 state.tree.apply(LayerOp::Content(layer, None));
                 state.tree.note_content(layer, content.as_ref());
                 if let Some(mut old) = renderer.set_content(surface, layer, content)
-                    && old.clear_unique()
+                    && old.try_recycle()
                 {
                     recycled.push((layer, old));
                 }
@@ -652,19 +674,6 @@ fn commit<B: Backend>(
             Op::Install(install) => {
                 state.commits = Commits::Other;
                 install(&mut *renderer);
-            }
-            Op::ExternalFrame {
-                layer,
-                opaque,
-                install,
-            } => {
-                // A frame swap is a change like any other — `commits`
-                // still rises from `Clean` — but it is recorded apart, so
-                // a backend with planes can tell a plane-only frame (#90).
-                install(&mut *renderer);
-                state.tree.note_installed(layer, opaque);
-                state.commits = state.commits.max(Commits::Installs);
-                state.plane_frames.insert(layer);
             }
         }
     }
@@ -882,14 +891,14 @@ async fn render_local<B: Backend>(
 #[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
 mod tests {
     use super::{Commits, Presentation, SurfaceState, commit};
-    use crate::WorkingColor;
     use crate::backend::Visibility;
     use crate::backend::{Backend, Display};
-    use crate::display_list::{Command, DisplayList, Picture};
+    use crate::display_list::{DisplayList, Picture};
     use crate::engine::{SurfaceWaker, Waker};
     use crate::message::{ChangeSet, ContentOp, LayerId, LayerOp, Op, SurfaceId};
     use crate::testing::{Null, NullConfig};
     use crate::tree::SurfaceTree;
+    use crate::{Draw, WorkingColor};
 
     #[test]
     fn caller_shared_picture_is_not_recycled() {
@@ -901,9 +910,9 @@ mod tests {
         .expect("null backend");
         let surface = SurfaceId::new(1);
         let layer = LayerId::new(0);
-        let mut list = DisplayList::with_capacity(1);
-        list.push(Command::End);
-        let caller_picture = Picture::new(list);
+        let caller_picture = Picture::record(|c| {
+            c.fill(crate::kurbo::Rect::new(0., 0., 1., 1.), WorkingColor::WHITE);
+        });
         let mut state = SurfaceState {
             tree: SurfaceTree::new(),
             size: (1, 1),
@@ -933,7 +942,9 @@ mod tests {
             clear: None,
             ops: vec![Op::Layer(LayerOp::Content(
                 layer,
-                Some(ContentOp::Picture(Picture::new(DisplayList::default()))),
+                Some(ContentOp::Picture(Picture::from_list(
+                    DisplayList::default(),
+                ))),
             ))],
             recycled: Vec::new(),
             animating: false,
@@ -1012,6 +1023,9 @@ impl<B: Backend> LocalState<B> {
                 set_visibility::<B>(renderer, surfaces, id, visibility);
             }
             Message::Resource(op) => op(renderer),
+            Message::ProducerFrame { opaque, apply, .. } => {
+                producer_frame::<B>(renderer, surfaces, opaque, apply);
+            }
             Message::Register { resource, op } => {
                 let result = op(renderer).await;
                 resources.register(resource, result);

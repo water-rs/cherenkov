@@ -38,10 +38,15 @@ impl std::fmt::Debug for LayoutSize {
     }
 }
 
+impl Default for LayoutSize {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LayoutSize {
-    /// A layer's size before its host sets one.
-    // Engine seam: the installing surface creates it per layer.
-    #[doc(hidden)]
+    /// A layer's size before its host sets one — a target owns exactly
+    /// one per layer and hands it to every recording for that layer.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -54,9 +59,9 @@ impl LayoutSize {
 
     /// Sets the size, notifying bound recordings when it changed. The
     /// context's metadata travels with the change, so an [`Animation`] in
-    /// it animates the bound operands.
-    // Engine seam: the layer's layout_size edit calls this.
-    #[doc(hidden)]
+    /// it animates every operand bound to the size. Built by
+    /// [`change`](Self::change), or by a nami context the host's own
+    /// layout signal carries.
     pub fn set(&self, change: &Context<Size>) {
         if *change.value() == self.inner.value.get() {
             return;
@@ -65,9 +70,10 @@ impl LayoutSize {
         self.inner.watchers.notify(change);
     }
 
-    /// The change a transaction makes: `size` under `animation`, if any.
-    // Engine seam: the layer's layout_size edit builds it.
-    #[doc(hidden)]
+    /// The change a transaction makes: `size` under `animation`, if any —
+    /// what [`set`](Self::set) consumes, so the host can put a resize
+    /// under an animation the same way a bound signal's change carries
+    /// one.
     #[must_use]
     pub fn change(size: Size, animation: Option<Animation>) -> Context<Size> {
         let context = Context::new(size, Metadata::new());

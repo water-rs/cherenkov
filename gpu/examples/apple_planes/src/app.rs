@@ -26,6 +26,7 @@ use objc2_ui_kit::{UIScreen, UIView};
 
 use crate::log;
 use crate::observe::{self, Decisions};
+use crate::pattern::{HEIGHT, WIDTH};
 use crate::producer::Pool;
 use crate::scenario::{self, Scenario};
 
@@ -352,6 +353,8 @@ struct Logged {
 struct Video {
     layer: Layer,
     producer: Pool,
+    video: cherenkov::GpuProducer<Gpu>,
+    sink: cherenkov::FrameSink<Gpu>,
 }
 
 /// A view dimension in points → device pixels at `scale`.
@@ -410,9 +413,17 @@ impl Run {
             .expect("display announcement");
         surface.clear_color(WorkingColor::new([0.01, 0.012, 0.018, 1.0]));
         let built = scenario.build(&surface);
-        let video = built.video.map(|layer| Video {
-            layer,
-            producer: Pool::new(&shared, paused),
+        let video = built.video.map(|layer| {
+            let (video, sink) = engine.frame_producer();
+            surface.update(|tx| {
+                tx[&layer].content(video.at((WIDTH, HEIGHT)));
+            });
+            Video {
+                layer,
+                producer: Pool::new(&shared, paused),
+                video,
+                sink,
+            }
         });
         Self {
             #[cfg(target_os = "ios")]
@@ -488,11 +499,7 @@ impl Run {
             && let Some(video) = &mut self.video
             && let Some(frame) = video.producer.produce()
         {
-            let handle = self.engine.external_frame(frame);
-            let surface = &self.surface;
-            surface.update(|tx| {
-                tx[&video.layer].content(handle);
-            });
+            video.sink.submit(frame);
             self.presented += 1;
         }
         if !self.cooling

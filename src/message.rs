@@ -34,6 +34,16 @@ pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer) + Send>;
 /// A resource operation that stays on the creating JS thread.
 #[cfg(target_arch = "wasm32")]
 pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer)>;
+/// A submitted frame's application: installs the frame on the render side
+/// and returns the `(surface, layer)` pairs the producer is bound on, so
+/// the frame's declared alpha contract is noted on each of them.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ProducerApply<B> =
+    Box<dyn FnOnce(&mut <B as Backend>::Renderer) -> Vec<(SurfaceId, LayerId)> + Send>;
+/// The owning JS thread's [`ProducerApply`].
+#[cfg(target_arch = "wasm32")]
+pub type ProducerApply<B> =
+    Box<dyn FnOnce(&mut <B as Backend>::Renderer) -> Vec<(SurfaceId, LayerId)>>;
 /// A registration the backend may reject: the render loop records the
 /// rejection against the resource.
 #[cfg(not(target_arch = "wasm32"))]
@@ -74,6 +84,25 @@ impl SurfaceId {
 pub struct LayerId(u64);
 
 impl LayerId {
+    /// Creates an identifier from a raw value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Identifier of a GPU producer shared across surfaces, allocated by
+/// [`Engine::gpu_producer`](crate::Engine::gpu_producer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProducerId(u64);
+
+impl ProducerId {
     /// Creates an identifier from a raw value.
     #[must_use]
     pub const fn new(raw: u64) -> Self {
@@ -227,19 +256,6 @@ pub enum Op<B: Backend> {
     /// A render-side install replaced `layer`'s recorded content, so its
     /// painted output is the producer's and not known to be opaque.
     Installed(LayerId),
-    /// An external frame's install on `layer`
-    /// ([`ExternalFrames`](crate::ExternalFrames)): applied in order like
-    /// [`Install`](Self::Install), but named so the frame can report which
-    /// layers' frames are new — a planes-capable backend presents those
-    /// alone when they are the surface's only change (#90).
-    ExternalFrame {
-        /// The layer the frame attaches to.
-        layer: LayerId,
-        /// Whether the frame's declared alpha contract is fully opaque.
-        opaque: bool,
-        /// The install, applied in order.
-        install: ResOp<B>,
-    },
 }
 
 /// The committed change set for one surface.
@@ -327,6 +343,21 @@ pub enum Message<B: Backend> {
     /// An opaque render-thread operation that cannot fail: font, filter
     /// and effect registration and removal, capability hooks.
     Resource(ResOp<B>),
+    /// A submitted frame for a frame producer
+    /// ([`FrameSink::submit`](crate::FrameSink::submit)). Applied in order;
+    /// the layers the producer is bound on get the frame's declared alpha
+    /// contract noted and count as a frame swap on their surface — a
+    /// planes-capable backend presents those alone when they are the
+    /// surface's only change (#90).
+    ProducerFrame {
+        /// The producer the frame belongs to.
+        producer: ProducerId,
+        /// Whether the frame's declared alpha contract is fully opaque.
+        opaque: bool,
+        /// Installs the frame and returns the layers the producer is
+        /// bound on.
+        apply: ProducerApply<B>,
+    },
     /// Register a resource the backend may reject. A rejection is recorded
     /// against `resource`, and every render that draws it fails with
     /// [`RenderError::Rejected`].

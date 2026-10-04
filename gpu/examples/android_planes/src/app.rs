@@ -15,6 +15,7 @@ use cherenkov_gpu::interop::{ExternalFrame, SharedDevice, vulkan};
 use cherenkov_gpu::{Gpu, GpuConfig};
 use ndk::native_window::NativeWindow;
 
+use crate::ahb::{HEIGHT, WIDTH};
 use crate::observe::{self, Decisions};
 use crate::producer::Pool;
 use crate::scenario::Scenario;
@@ -186,6 +187,8 @@ struct Run {
 struct Video {
     layer: Layer,
     producer: Pool,
+    video: cherenkov::GpuProducer<Gpu>,
+    sink: cherenkov::FrameSink<Gpu>,
 }
 
 impl Run {
@@ -242,9 +245,17 @@ impl Run {
         let videos: Vec<Video> = specs
             .into_iter()
             .zip(layers)
-            .map(|(spec, layer)| Video {
-                layer,
-                producer: Pool::new(&vk, spec, paused).expect("producer pool"),
+            .map(|(spec, layer)| {
+                let (video, sink) = engine.frame_producer();
+                surface.update(|tx| {
+                    tx[&layer].content(video.at((WIDTH, HEIGHT)));
+                });
+                Video {
+                    layer,
+                    producer: Pool::new(&vk, spec, paused).expect("producer pool"),
+                    video,
+                    sink,
+                }
             })
             .collect();
         logcat::line(&format!("{} video layer(s) built", videos.len()));
@@ -294,20 +305,15 @@ impl Run {
         if let Some(scene) = &mut self.recorded {
             scene.tick(&self.surface);
         }
-        self.surface.update(|tx| {
-            for video in &mut self.videos {
-                let Some(frame) = video.producer.produce() else {
-                    continue;
-                };
-                match ExternalFrame::native(frame) {
-                    Ok(external) => {
-                        let handle = self.engine.external_frame(external);
-                        tx[&video.layer].content(handle);
-                    }
-                    Err(e) => logcat::error(&format!("external frame rejected: {e}")),
-                }
+        for video in &mut self.videos {
+            let Some(frame) = video.producer.produce() else {
+                continue;
+            };
+            match ExternalFrame::native(frame) {
+                Ok(external) => video.sink.submit(external),
+                Err(e) => logcat::error(&format!("external frame rejected: {e}")),
             }
-        });
+        }
         match self.engine.render(FrameTime::now()) {
             Ok(_) => {
                 if !self.logged_first_frame {

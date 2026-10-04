@@ -12,9 +12,12 @@ use nami_core::Signal;
 
 use crate::Instant;
 use crate::animation::{AnimLanes, Animation, OperandTrack};
-use crate::display_list::{Command, DisplayList, Operand, Picture, Slot, SlotUpdate};
+use crate::display_list::{
+    Command, DisplayList, DisplayListView, Operand, Picture, Slot, SlotUpdate,
+};
 use crate::glyph::GlyphRun;
 use crate::paint::{ImageId, Paint, Sampling};
+use crate::resource::ResourceId;
 use crate::shape::Shape;
 use crate::size::LayoutSize;
 use crate::style::{Group, Shadow};
@@ -108,7 +111,7 @@ impl Picture {
     pub fn record(body: impl FnOnce(&mut StaticRecorder)) -> Self {
         let mut recorder = StaticRecorder::default();
         body(&mut recorder);
-        Self::new(recorder.list)
+        Self::from_list(recorder.list)
     }
 }
 
@@ -202,8 +205,7 @@ impl Draw for StaticRecorder {
 
 /// A signal consumer. Recorded slots keep their concrete callback state inline;
 /// property bindings additionally receive animation metadata.
-#[doc(hidden)]
-pub struct Watch<T> {
+struct Watch<T> {
     destination: Destination<T>,
 }
 
@@ -217,8 +219,8 @@ enum Destination<T> {
 }
 
 impl<T> Watch<T> {
-    // Engine seam: layer property bindings notify through this.
-    pub fn binding(callback: impl Fn(nami_core::watcher::Context<T>) + 'static) -> Self {
+    // The destination `Live::watch` subscriptions notify through.
+    fn binding(callback: impl Fn(nami_core::watcher::Context<T>) + 'static) -> Self {
         Self {
             destination: Destination::Binding(Box::new(callback)),
         }
@@ -252,8 +254,7 @@ impl<T> Watch<T> {
 }
 
 /// A signal's subscription factory and the guard keeping it alive.
-#[doc(hidden)]
-pub struct Subscribe<T>(Option<Box<dyn Subscription<T>>>);
+struct Subscribe<T>(Option<Box<dyn Subscription<T>>>);
 
 trait Subscription<T> {
     fn start(self: Box<Self>, watch: Watch<T>) -> Option<Box<dyn Any>>;
@@ -285,20 +286,23 @@ impl<T> Subscribe<T> {
         reason = "expose the concrete subscription to the recorder's call site"
     )]
     #[inline(always)]
-    // Engine seam: layer property bindings start their watches through this.
+    // Starts the watch `Live::watch` and the recorder's slot subscriptions
+    // share.
     #[must_use]
-    pub fn start(self, watch: Watch<T>) -> Option<Box<dyn Any>> {
+    fn start(self, watch: Watch<T>) -> Option<Box<dyn Any>> {
         self.0.and_then(|subscription| subscription.start(watch))
     }
 }
 
 /// A value accepted by [`Recorder`]: a [`Fixed`] value, or the current value
 /// of a nami signal with the subscription that reports its later changes.
+///
+/// Outside a recording, a target binds a property to a `Live` through
+/// [`Live::watch`]: layer properties take `impl Into<Live<T>>`, so a bound
+/// signal keeps updating the property with no further transaction.
 pub struct Live<T> {
-    #[doc(hidden)]
-    pub value: T,
-    #[doc(hidden)]
-    pub subscribe: Subscribe<T>,
+    value: T,
+    subscription: Subscribe<T>,
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Live<T> {
@@ -314,7 +318,7 @@ impl<T> From<Fixed<T>> for Live<T> {
     fn from(value: Fixed<T>) -> Self {
         Self {
             value: value.0,
-            subscribe: Subscribe(None),
+            subscription: Subscribe(None),
         }
     }
 }
@@ -329,14 +333,61 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
         let value = signal.snapshot();
         Self {
             value,
-            subscribe: Subscribe(Some(Box::new(SignalSubscription(signal)))),
+            subscription: Subscribe(Some(Box::new(SignalSubscription(signal)))),
         }
+    }
+}
+
+/// The guard keeping a [`Live::watch`] subscription alive.
+///
+/// A binding stores it for the binding's life; dropping it unsubscribes the
+/// watch, so the signal's later changes no longer reach the property.
+pub struct Binding {
+    _guard: Box<dyn Any>,
+}
+
+impl<T> Live<T> {
+    /// The value a binding starts from: the constant, or the signal's
+    /// value when the `Live` was made.
+    #[must_use]
+    pub const fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Binds `watcher` to the source signal's later changes — the one
+    /// subscription API a target uses to bind a layer property to a
+    /// signal. The watcher runs on the recording thread with the change's
+    /// [`Context`](nami_core::watcher::Context): its value is the property's
+    /// new target, and an [`Animation`] in its metadata is the animation
+    /// the change was made under.
+    ///
+    /// Returns the value the binding starts from and the guard keeping
+    /// the subscription alive — `None` for a constant, which never calls
+    /// the watcher, or a signal whose watch needs no storage. Either way
+    /// the binding replaces the property's previous one.
+    #[expect(
+        clippy::inline_always,
+        reason = "expose the concrete subscription to the binding's call site"
+    )]
+    #[inline(always)]
+    pub fn watch(
+        self,
+        watcher: impl Fn(nami_core::watcher::Context<T>) + 'static,
+    ) -> (T, Option<Binding>) {
+        let Self {
+            value,
+            subscription,
+        } = self;
+        let guard = subscription
+            .start(Watch::binding(watcher))
+            .map(|guard| Binding { _guard: guard });
+        (value, guard)
     }
 }
 
 /// State shared between a [`Content`] and the watchers of its signals.
 #[derive(Default)]
-pub struct LiveState {
+pub(crate) struct LiveState {
     pending: RefCell<Vec<SlotUpdate>>,
     /// Queued animated changes and running tracks. `None` until the
     /// first animated change, so a static `LiveState` costs one
@@ -344,14 +395,13 @@ pub struct LiveState {
     anim: Cell<Option<Box<AnimState>>>,
     /// Set while queued animates or running tracks make
     /// [`LiveState::sample`] worth its borrows.
-    // Engine seam: the surface drain probes it as a plain cell read —
-    // `sample` is a real call on every static content otherwise.
-    #[doc(hidden)]
-    pub needs_sample: Cell<bool>,
+    // The surface drain probes it as a plain cell read — `sample` is a
+    // real call on every static content otherwise.
+    needs_sample: Cell<bool>,
     /// The installing surface's "a content may be sampling" flag,
     /// poked by [`LiveState::animate`] so a fully static surface can
     /// skip per-content probes. Detached when the content retires.
-    surface_animated: RefCell<Option<Rc<Cell<bool>>>>,
+    surface_animated: RefCell<Option<SampleFlag>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     /// The surface the content is installed on. Detached when the content
     /// retires.
@@ -524,11 +574,11 @@ impl LiveState {
     /// Attaches the owning surface's sampling flag: `animate` pokes it
     /// once set, and a state that already needs sampling sets it
     /// immediately so nothing queues behind an install.
-    fn attach_animated(&self, flag: &Rc<Cell<bool>>) {
+    fn attach_animated(&self, flag: &SampleFlag) {
         if self.needs_sample.get() {
             flag.set(true);
         }
-        *self.surface_animated.borrow_mut() = Some(Rc::clone(flag));
+        *self.surface_animated.borrow_mut() = Some(flag.clone());
     }
 
     /// Detaches the surface's sampling flag when the content retires
@@ -575,7 +625,7 @@ impl Recorder {
                 picture.put_unique_list(self.list);
                 picture
             }
-            None => Picture::new(self.list),
+            None => Picture::from_list(self.list),
         };
         Content {
             picture,
@@ -629,10 +679,10 @@ impl Draw for Recorder {
             shape: shape_data,
             paint: paint_data,
         });
-        self.subscribe(shape.subscribe, command, |shape: S| {
+        self.subscribe(shape.subscription, command, |shape: S| {
             Operand::Shape(shape.into_data())
         });
-        self.subscribe(paint.subscribe, command, paint_operand::<P>);
+        self.subscribe(paint.subscription, command, paint_operand::<P>);
     }
 
     fn stroke<S: Shape, P: Into<Paint> + 'static>(
@@ -649,11 +699,11 @@ impl Draw for Recorder {
             stroke: stroke.value,
             paint: paint_data,
         });
-        self.subscribe(shape.subscribe, command, |shape: S| {
+        self.subscribe(shape.subscription, command, |shape: S| {
             Operand::Shape(shape.into_data())
         });
-        self.subscribe(stroke.subscribe, command, Operand::Stroke);
-        self.subscribe(paint.subscribe, command, paint_operand::<P>);
+        self.subscribe(stroke.subscription, command, Operand::Stroke);
+        self.subscribe(paint.subscription, command, paint_operand::<P>);
     }
 
     fn shadow<S: Shape>(&mut self, shape: impl Into<Live<S>>, shadow: impl Into<Live<Shadow>>) {
@@ -663,10 +713,10 @@ impl Draw for Recorder {
             shape: shape_data,
             shadow: shadow.value,
         });
-        self.subscribe(shape.subscribe, command, |shape: S| {
+        self.subscribe(shape.subscription, command, |shape: S| {
             Operand::Shape(shape.into_data())
         });
-        self.subscribe(shadow.subscribe, command, Operand::Shadow);
+        self.subscribe(shadow.subscription, command, Operand::Shadow);
     }
 
     #[expect(
@@ -686,8 +736,8 @@ impl Draw for Recorder {
             run: run.value,
             paint: paint_data,
         });
-        self.subscribe(run.subscribe, command, Operand::Run);
-        self.subscribe(paint.subscribe, command, paint_operand::<P>);
+        self.subscribe(run.subscription, command, Operand::Run);
+        self.subscribe(paint.subscription, command, paint_operand::<P>);
     }
 
     fn image(&mut self, image: ImageId, dst: impl Into<Live<Rect>>, sampling: Sampling) {
@@ -697,7 +747,7 @@ impl Draw for Recorder {
             dst: dst.value,
             sampling,
         });
-        self.subscribe(dst.subscribe, command, Operand::Rect);
+        self.subscribe(dst.subscription, command, Operand::Rect);
     }
 
     fn picture(&mut self, picture: &Picture, transform: impl Into<Live<Affine>>) {
@@ -706,7 +756,7 @@ impl Draw for Recorder {
             picture: picture.clone(),
             transform: transform.value,
         });
-        self.subscribe(transform.subscribe, command, Operand::Transform);
+        self.subscribe(transform.subscription, command, Operand::Transform);
     }
 
     fn clip<S: Shape>(&mut self, shape: impl Into<Live<S>>, body: impl FnOnce(&mut Self)) {
@@ -716,7 +766,7 @@ impl Draw for Recorder {
             shape: shape_data,
             end: 0,
         });
-        self.subscribe(shape.subscribe, begin, |shape: S| {
+        self.subscribe(shape.subscription, begin, |shape: S| {
             Operand::Shape(shape.into_data())
         });
         body(self);
@@ -729,7 +779,7 @@ impl Draw for Recorder {
             transform: transform.value,
             end: 0,
         });
-        self.subscribe(transform.subscribe, begin, Operand::Transform);
+        self.subscribe(transform.subscription, begin, Operand::Transform);
         body(self);
         self.list.end(begin);
     }
@@ -740,9 +790,65 @@ impl Draw for Recorder {
             group: group.value,
             end: 0,
         });
-        self.subscribe(group.subscribe, begin, Operand::Group);
+        self.subscribe(group.subscription, begin, Operand::Group);
         body(self);
         self.list.end(begin);
+    }
+}
+
+/// The "something needs sampling" bit a target keeps per surface.
+///
+/// [`Content::attach`] connects an installed content to it: an animated
+/// operand arriving sets it, so a surface with any live content knows a
+/// frame must sample without probing every content's
+/// [`needs_sample`](Content::needs_sample). The target clears it after a
+/// sampling pass in which nothing still animates.
+#[derive(Clone, Default)]
+pub struct SampleFlag(Rc<Cell<bool>>);
+
+impl SampleFlag {
+    /// A clear flag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether an attached content needs sampling; a plain cell read.
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.0.get()
+    }
+
+    /// Sets or clears the flag.
+    pub fn set(&self, sampling: bool) {
+        self.0.set(sampling);
+    }
+}
+
+/// Whether a [`Content::sample`] left operand animations running: another
+/// frame is required to keep them moving.
+///
+/// A bool newtype so a call site cannot confuse the answer with the
+/// sampled instant or an operand count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Animating(bool);
+
+impl Animating {
+    /// The idle answer: nothing still animates.
+    pub const IDLE: Self = Self(false);
+    /// The running answer: another frame is required.
+    pub const RUNNING: Self = Self(true);
+
+    /// Whether another frame is required.
+    #[must_use]
+    pub const fn is_animating(&self) -> bool {
+        self.0
+    }
+}
+
+impl From<bool> for Animating {
+    fn from(animating: bool) -> Self {
+        Self(animating)
     }
 }
 
@@ -755,22 +861,35 @@ impl Draw for Recorder {
 /// the render thread is the owned [`ContentChange`].
 pub struct Content {
     picture: Picture,
-    // Engine seam: the installing surface samples through it and probes
-    // `needs_sample` per frame.
-    #[doc(hidden)]
-    pub live: Rc<LiveState>,
+    live: Rc<LiveState>,
     sent: bool,
 }
 
 /// Spare storage a retired [`Content`] leaves for the next recording.
-// Engine seam: the surface's content slots recycle through it.
+///
+/// Its contents are opaque: a target stores it between recordings and hands
+/// it back whole to [`Content::record_into`].
 #[derive(Default)]
-#[doc(hidden)]
 pub struct ContentSpare {
     /// The recycled picture storage.
-    pub picture: Option<Picture>,
+    picture: Option<Picture>,
     /// The recycled live state.
-    pub live: Option<Rc<LiveState>>,
+    live: Option<Rc<LiveState>>,
+}
+
+impl ContentSpare {
+    /// Hands the picture storage a render thread returned for reuse to the
+    /// next [`Content::record_into`].
+    pub fn put_picture(&mut self, picture: Picture) {
+        self.picture = Some(picture);
+    }
+
+    /// Folds another spare's live state into this one, keeping this spare's
+    /// picture storage: what a replaced content's [`Content::retire`] hands
+    /// back.
+    pub fn merge(&mut self, other: Self) {
+        self.live = other.live;
+    }
 }
 
 impl std::fmt::Debug for Content {
@@ -783,18 +902,20 @@ impl std::fmt::Debug for Content {
 }
 
 impl Content {
-    /// Records content for a layer laid out at `size`.
-    // Engine seam: the installing surface records through this.
-    #[doc(hidden)]
-    pub fn record(size: LayoutSize, body: impl FnOnce(&mut Recorder)) -> Self {
+    /// Records content for a layer laid out at `size` — the [`LayoutSize`]
+    /// the target owns for the layer, which the recording reads through
+    /// [`Recorder::layout_size`]. This is how any host produces content.
+    #[must_use]
+    pub fn record(size: &LayoutSize, body: impl FnOnce(&mut Recorder)) -> Self {
         Self::record_with_capacity(0, size, body)
     }
 
-    // Engine seam: the surface reuses a replaced content's storage.
-    #[doc(hidden)]
-    pub fn record_reusing(
+    /// Records into the `spare` a retired content handed back, reusing its
+    /// picture storage and live state; a fresh recording when `spare` is
+    /// empty.
+    pub fn record_into(
         mut spare: ContentSpare,
-        size: LayoutSize,
+        size: &LayoutSize,
         body: impl FnOnce(&mut Recorder),
     ) -> Self {
         let (picture, list) = spare.picture.take().map_or_else(
@@ -819,14 +940,16 @@ impl Content {
             list,
             live,
             picture,
-            size,
+            size: size.clone(),
         };
         body(&mut recorder);
         recorder.finish()
     }
 
-    // Engine seam: a replaced content leaves its spare to the surface.
-    #[doc(hidden)]
+    /// Retires the content, detaching its owner and sampling flag and
+    /// releasing its subscriptions: after this call the owner receives no
+    /// more change notifications. The spare it hands back keeps the
+    /// recording's live state for the next [`record_into`](Self::record_into).
     #[must_use]
     pub fn retire(self) -> ContentSpare {
         let Self { picture, live, .. } = self;
@@ -853,29 +976,40 @@ impl Content {
     /// same content.
     pub(crate) fn record_with_capacity(
         capacity: usize,
-        size: LayoutSize,
+        size: &LayoutSize,
         body: impl FnOnce(&mut Recorder),
     ) -> Self {
         let mut recorder = Recorder {
             list: DisplayList::with_capacity(capacity),
             live: Rc::default(),
             picture: None,
-            size,
+            size: size.clone(),
         };
         body(&mut recorder);
         recorder.list.trim_spare();
         Self {
-            picture: Picture::new(recorder.list),
+            picture: Picture::from_list(recorder.list),
             live: recorder.live,
             sent: false,
         }
     }
 
-    /// Connect installed live operands to the owning surface and its
+    /// Whether a [`sample`](Self::sample) call has work: an animated
+    /// change arrived or a track still runs. A plain cell read — a target
+    /// may probe every content per frame.
+    #[must_use]
+    pub fn needs_sample(&self) -> bool {
+        self.live.needs_sample.get()
+    }
+
+    /// Connects the content's live operands to the surface `owner` and its
     /// sampling flag.
-    // Engine seam: the surface attaches itself on install.
-    #[doc(hidden)]
-    pub fn attach_owner(&self, owner: Weak<dyn LiveOwner>, flag: &Rc<Cell<bool>>) {
+    ///
+    /// A target calls it once, on install: a signal change then reaches
+    /// the owner through [`LiveOwner::changed`], and an animated change
+    /// sets `flag` so the target knows a frame must sample. A constant
+    /// recording attaches nothing. [`retire`](Self::retire) detaches both.
+    pub fn attach(&mut self, owner: Weak<dyn LiveOwner>, flag: &SampleFlag) {
         // Constant recordings need no owner or weak-count traffic.
         if !self.live.guards.borrow().is_empty() {
             *self.live.owner.borrow_mut() = Some(owner);
@@ -908,15 +1042,32 @@ impl Content {
         self.picture.display_list().is_empty()
     }
 
-    /// Samples every running operand animation at `time`, queueing the
-    /// operand updates [`take_change`](Self::take_change) drains. Returns
-    /// `true` while animations still run — the surface needs another frame
-    /// to keep them moving.
-    // Engine seam: the surface drain samples before each commit.
-    #[doc(hidden)]
+    /// The recorded list as a render target lowers it, with every change
+    /// [`take_change`](Self::take_change) has emitted applied. See
+    /// [`DisplayListView`].
     #[must_use]
-    pub fn sample(&self, time: Instant) -> bool {
-        self.live.sample(time, self.picture.display_list())
+    pub fn view(&self) -> DisplayListView<'_> {
+        self.picture.display_list().view()
+    }
+
+    /// Whether any command, including those of nested pictures, names
+    /// `resource`: a glyph run's font, an image draw, or an image or
+    /// shader paint — a target's resource-liveness bookkeeping.
+    #[must_use]
+    pub fn references(&self, resource: ResourceId) -> bool {
+        self.picture.display_list().references(resource)
+    }
+
+    /// Samples every running operand animation at `now`, queueing the
+    /// operand updates [`take_change`](Self::take_change) drains. The
+    /// [`Animating`] answer tells the target whether another frame is
+    /// required to keep them moving.
+    ///
+    /// A target samples before it reads the list for a commit, and never
+    /// samples while it is reading the list.
+    #[must_use]
+    pub fn sample(&mut self, now: Instant) -> Animating {
+        Animating(self.live.sample(now, self.picture.display_list()))
     }
 
     /// The change to send at the next commit, if any. The first call sends the
@@ -1041,10 +1192,10 @@ mod tests {
 
     #[test]
     fn shared_retired_picture_falls_back_to_fresh_storage() {
-        let mut content = Content::record(LayoutSize::new(), |_| {});
+        let mut content = Content::record(&LayoutSize::new(), |_| {});
         let pointer = std::ptr::from_ref(content.picture.display_list());
         let held = content.take_change();
-        let reused = Content::record_reusing(content.retire(), LayoutSize::new(), |_| {});
+        let reused = Content::record_into(content.retire(), &LayoutSize::new(), |_| {});
         assert_ne!(std::ptr::from_ref(reused.picture.display_list()), pointer);
         drop(held);
     }
@@ -1066,7 +1217,7 @@ mod tests {
         };
         let glyphs = run.glyphs.as_ptr();
         let coords = run.coords.as_ptr();
-        let content = Content::record(LayoutSize::new(), |c| c.glyphs(Fixed(run), red()));
+        let content = Content::record(&LayoutSize::new(), |c| c.glyphs(Fixed(run), red()));
         let Command::Glyphs { run, .. } = &content.picture.display_list().commands()[0] else {
             panic!("the recorded glyph run");
         };
@@ -1093,7 +1244,7 @@ mod tests {
         }
 
         let calls = Rc::new(std::cell::Cell::new(0));
-        let content = Content::record(LayoutSize::new(), |c| {
+        let content = Content::record(&LayoutSize::new(), |c| {
             c.fill(Observed(Rc::clone(&calls)), red());
         });
         assert_eq!(calls.get(), 1);
@@ -1103,7 +1254,7 @@ mod tests {
     #[test]
     fn a_signal_change_regenerates_only_the_commands_that_reference_it() {
         let radius = binding::<f64>(8.);
-        let mut content = Content::record(LayoutSize::new(), |c| {
+        let mut content = Content::record(&LayoutSize::new(), |c| {
             c.fill(Rect::new(0., 0., 10., 10.), red());
             c.fill(radius.map(|r| Circle::new((50., 50.), r)), red());
             c.fill(Rect::new(20., 20., 30., 30.), red());
@@ -1131,13 +1282,13 @@ mod tests {
 
     #[test]
     fn a_capacity_hint_records_the_same_list() {
-        let first = Content::record_with_capacity(0, LayoutSize::new(), |c| {
+        let first = Content::record_with_capacity(0, &LayoutSize::new(), |c| {
             for i in 0..4 {
                 c.fill(Rect::new(f64::from(i), 0., 10., 10.), red());
             }
         });
         assert_eq!(first.len(), 4);
-        let second = Content::record_with_capacity(first.len(), LayoutSize::new(), |c| {
+        let second = Content::record_with_capacity(first.len(), &LayoutSize::new(), |c| {
             for i in 0..4 {
                 c.fill(Rect::new(f64::from(i), 0., 10., 10.), red());
             }
@@ -1148,7 +1299,7 @@ mod tests {
     #[test]
     fn a_scope_change_regenerates_the_whole_scope() {
         let offset = binding::<f64>(0.);
-        let mut content = Content::record(LayoutSize::new(), |c| {
+        let mut content = Content::record(&LayoutSize::new(), |c| {
             c.fill(Rect::new(0., 0., 1., 1.), red());
             c.transform(offset.map(|x| Affine::translate((x, 0.))), |c| {
                 c.fill(Rect::new(0., 0., 1., 1.), red());
@@ -1173,7 +1324,7 @@ mod tests {
     #[test]
     fn repeated_changes_before_a_commit_send_one_update() {
         let radius = binding::<f64>(1.);
-        let mut content = Content::record(LayoutSize::new(), |c| {
+        let mut content = Content::record(&LayoutSize::new(), |c| {
             c.fill(radius.map(|r| Circle::new((0., 0.), r)), red());
         });
         let _ = content.take_change();
@@ -1192,7 +1343,7 @@ mod tests {
     #[test]
     fn an_animated_operand_steps_into_take_change() {
         let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
-        let mut content = Content::record(LayoutSize::new(), |c| {
+        let mut content = Content::record(&LayoutSize::new(), |c| {
             c.fill(
                 Rect::new(0., 0., 10., 10.),
                 colour.clone().with(Animation::from(Curve::linear(
@@ -1209,7 +1360,7 @@ mod tests {
         colour.set(WorkingColor::new([0., 1., 0., 1.]));
         assert_eq!(content.take_change(), None, "the change defers to sampling");
         let start = Instant::now();
-        assert!(content.sample(start), "the track is running");
+        assert!(content.sample(start).is_animating(), "the track is running");
         let Some(ContentChange::Update(updates)) = content.take_change() else {
             panic!("the first sample sends an update");
         };
@@ -1219,7 +1370,11 @@ mod tests {
         );
 
         // Half-way the sampled paint is the endpoints' midpoint.
-        assert!(content.sample(start + std::time::Duration::from_millis(200)));
+        assert!(
+            content
+                .sample(start + std::time::Duration::from_millis(200))
+                .is_animating()
+        );
         let Some(ContentChange::Update(updates)) = content.take_change() else {
             panic!("a mid-flight sample sends an update");
         };
@@ -1229,7 +1384,11 @@ mod tests {
         assert!((mid.components[1] - 0.5).abs() < 0.01, "mid {mid:?}");
 
         // The settling sample reports the target exactly and stops running.
-        assert!(!content.sample(start + std::time::Duration::from_millis(400)));
+        assert!(
+            !content
+                .sample(start + std::time::Duration::from_millis(400))
+                .is_animating()
+        );
         let Some(ContentChange::Update(updates)) = content.take_change() else {
             panic!("the settling sample sends an update");
         };
@@ -1247,7 +1406,7 @@ mod tests {
     #[test]
     fn a_retargeted_operand_animates_from_its_sampled_position() {
         let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
-        let mut content = Content::record(LayoutSize::new(), |c| {
+        let mut content = Content::record(&LayoutSize::new(), |c| {
             c.fill(
                 Rect::new(0., 0., 10., 10.),
                 colour.clone().with(Animation::from(Curve::linear(
@@ -1259,7 +1418,11 @@ mod tests {
         let start = Instant::now();
 
         colour.set(WorkingColor::new([0., 1., 0., 1.]));
-        assert!(content.sample(start + std::time::Duration::from_millis(200)));
+        assert!(
+            content
+                .sample(start + std::time::Duration::from_millis(200))
+                .is_animating()
+        );
         let Some(ContentChange::Update(updates)) = content.take_change() else {
             panic!("the mid-flight sample sends an update");
         };
@@ -1269,7 +1432,11 @@ mod tests {
 
         // The retarget's first sample still holds the position it left at.
         colour.set(WorkingColor::new([0., 0., 1., 1.]));
-        assert!(content.sample(start + std::time::Duration::from_millis(208)));
+        assert!(
+            content
+                .sample(start + std::time::Duration::from_millis(208))
+                .is_animating()
+        );
         let Some(ContentChange::Update(updates)) = content.take_change() else {
             panic!("the retarget's first sample sends an update");
         };
@@ -1281,7 +1448,7 @@ mod tests {
 
         // It settles on the new target, not the interrupted one.
         let mut t = start + std::time::Duration::from_millis(208);
-        while content.sample(t) {
+        while content.sample(t).is_animating() {
             t += std::time::Duration::from_millis(16);
         }
         let Some(ContentChange::Update(updates)) = content.take_change() else {
@@ -1296,7 +1463,7 @@ mod tests {
     #[test]
     fn an_animated_change_without_shared_lanes_snaps() {
         let paint = binding(Paint::Solid(WorkingColor::new([1., 0., 0., 1.])));
-        let mut content = Content::record(LayoutSize::new(), |c| {
+        let mut content = Content::record(&LayoutSize::new(), |c| {
             c.fill(
                 Rect::new(0., 0., 10., 10.),
                 paint.clone().with(Animation::from(Curve::linear(
@@ -1321,7 +1488,7 @@ mod tests {
         };
         assert_eq!(updates[0].value, Operand::Paint(gradient));
         assert!(
-            !content.sample(Instant::now()),
+            !content.sample(Instant::now()).is_animating(),
             "a snapped change starts no track"
         );
     }
@@ -1329,7 +1496,7 @@ mod tests {
     #[test]
     fn dropping_content_releases_its_subscriptions() {
         let radius = binding::<f64>(1.);
-        let content = Content::record(LayoutSize::new(), |c| {
+        let content = Content::record(&LayoutSize::new(), |c| {
             c.fill(radius.map(|r| Circle::new((0., 0.), r)), red());
         });
         drop(content);
@@ -1364,7 +1531,7 @@ mod tests {
     #[test]
     #[cfg(feature = "serde")]
     fn change_sets_round_trip_through_serde() {
-        let mut content = Content::record(LayoutSize::new(), |c| {
+        let mut content = Content::record(&LayoutSize::new(), |c| {
             c.stroke(
                 Rect::new(0., 0., 1., 1.),
                 Stroke::new(2.),

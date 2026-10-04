@@ -169,8 +169,7 @@ impl Deps {
             .flat_map(|pass| &pass.ranges)
             .filter_map(|range| range.image.as_ref())
         {
-            let interop_source =
-                matches!(image, ImageSource::Content(_) | ImageSource::External(_));
+            let interop_source = matches!(image, ImageSource::Content(_));
             if interop_source {
                 deps.interop = Some(interop);
             }

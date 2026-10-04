@@ -12,18 +12,22 @@ use std::sync::Arc;
 use crate::ShaderId;
 use crate::backend::{Backend, Renderer};
 use crate::capability::{
-    Effects, ExternalFrames, Filters, GpuContent, Runs, ShaderPaint, ShaderSource, Uploads,
+    DrainedProducer, Effects, Filters, GpuContent, Runs, ShaderPaint, ShaderSource, Uploads,
 };
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameStats, FrameTime, FrameTiming, Next};
 use crate::glyph::FontId;
 use crate::image::{Format, ImageData};
-use crate::message::{ChangeSet, FontData, Message, RegisterOp, RenderReply, SurfaceId};
+use crate::message::{
+    ChangeSet, FontData, Message, ProducerId, RegisterOp, RenderReply, SurfaceId,
+};
 use crate::paint::ImageId;
-use crate::resource::{Filter, Font, FontSource, Image, ReplaceImage, ResourceId, Shader};
+use crate::resource::{
+    Filter, Font, FontSource, FrameSink, GpuProducer, Image, ReplaceImage, ResourceId, Shader,
+};
 use crate::style::FilterId;
-use crate::surface::{ExternalFrameHandle, GpuContentHandle, Shared, Surface};
+use crate::surface::{Shared, Surface};
 
 /// Owns the device and a serial executor on the creating JS thread.
 ///
@@ -49,6 +53,7 @@ pub struct Engine<B: Backend> {
     next_shader: Cell<u64>,
     next_filter: Cell<u64>,
     next_backdrop_shader: Cell<u64>,
+    next_producer: Cell<u64>,
     /// The type-erased sender resource drops use; an executor that is
     /// gone has nothing left to release.
     post: Rc<dyn Fn(Message<B>)>,
@@ -131,6 +136,7 @@ impl<B: Backend> Engine<B> {
             next_shader: Cell::new(1),
             next_filter: Cell::new(1),
             next_backdrop_shader: Cell::new(1),
+            next_producer: Cell::new(1),
             post: Rc::new(move |message| {
                 let _ = post_tx.send(message);
             }),
@@ -523,29 +529,81 @@ impl<B: Filters> Engine<B> {
 }
 
 impl<B: GpuContent> Engine<B> {
-    /// Creates GPU content of `size` pixels, attachable to a layer with
-    /// [`LayerEdit::content`](crate::LayerEdit::content).
+    /// Registers a GPU producer the engine's surfaces bind with
+    /// [`GpuProducer::at`]. The handle is `Clone`; every clone of the one
+    /// view instance's producer shares its renderer state, and there is
+    /// no cache keyed by content — a second call is a second producer.
+    /// The last drop retires it through the transaction stream.
     #[must_use]
-    pub fn gpu_content(
-        &self,
-        size: (u32, u32),
-        content: impl Into<B::Content>,
-    ) -> GpuContentHandle<B> {
-        GpuContentHandle {
-            size,
-            content: content.into(),
-        }
+    pub fn gpu_producer(&self, content: impl Into<B::Content>) -> GpuProducer<B> {
+        let id = ProducerId::new(Self::alloc(&self.next_producer));
+        let content = content.into();
+        (self.post)(Message::Resource(Box::new(move |r: &mut B::Renderer| {
+            B::add_gpu_producer(r, id, content);
+        })));
+        GpuProducer::new(id, self.tx.clone())
     }
-}
 
-impl<B: ExternalFrames> Engine<B> {
-    /// Wraps an externally produced frame, attachable to a layer with
-    /// [`LayerEdit::content`](crate::LayerEdit::content).
+    /// Creates a submitted-frame producer — one whose frames come from
+    /// the returned [`FrameSink`] instead of a `GpuContent` render — and
+    /// its [`GpuProducer`] for binding it to layers with
+    /// [`GpuProducer::at`].
+    ///
+    /// The producer has no setup and holds no content: its current frame
+    /// is whatever the sink last submitted, on the device it was
+    /// submitted to. A device replacement drops that frame; the next
+    /// [`FrameSink::submit`] supplies one on the new device.
     #[must_use]
-    pub fn external_frame(&self, frame: impl Into<B::Frame>) -> ExternalFrameHandle<B> {
-        ExternalFrameHandle {
-            frame: frame.into(),
-        }
+    pub fn frame_producer(&self) -> (GpuProducer<B>, FrameSink<B>) {
+        let id = ProducerId::new(Self::alloc(&self.next_producer));
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Arc::new(crate::WakeGate::default());
+        (self.post)(Message::Resource(Box::new({
+            let dirty = Arc::clone(&dirty);
+            let gate = Arc::clone(&gate);
+            move |r: &mut B::Renderer| {
+                B::add_frame_producer(r, id, dirty, gate);
+            }
+        })));
+        let engine_waker = Arc::clone(&self.waker);
+        (
+            GpuProducer::new(id, self.tx.clone()),
+            FrameSink::new(
+                id,
+                self.tx.clone(),
+                dirty,
+                gate,
+                Rc::new(move || engine_waker.wake()),
+            ),
+        )
+    }
+
+    /// The device-replacement contract: drains every live producer, the
+    /// render loop dropping their device resources — current frames and
+    /// frame rings — and releasing their bindings. A device replacement
+    /// re-registers each rendered producer's content on a fresh renderer
+    /// ([`gpu_producer`](Self::gpu_producer)) and rebinds; the first drawn
+    /// binding then runs the producer's `setup` again on the new device.
+    /// A frame producer's frame is device state and drops with the old
+    /// device — recreate the pair with [`frame_producer`](Self::frame_producer)
+    /// and submit again.
+    ///
+    /// # Errors
+    /// [`RenderError::Thread`] when the executor is gone.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    pub async fn drain_gpu_producers(
+        &self,
+    ) -> Result<Vec<(ProducerId, DrainedProducer<B>)>, RenderError> {
+        let (reply, rx) = crate::local::channel();
+        self.tx
+            .send(Message::Resource(Box::new(move |r: &mut B::Renderer| {
+                let _ = reply.send(B::drain_gpu_producers(r));
+            })))
+            .map_err(|_| RenderError::Thread)?;
+        rx.recv().await.map_err(|_| RenderError::Thread)
     }
 }
 

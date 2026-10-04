@@ -53,7 +53,7 @@ where
         let _ = renderer.set_content(
             id,
             layer,
-            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+            Some(ContentOp::Replace(crate::Picture::from_list(list.clone()))),
         );
         let _ = renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
     }
@@ -85,7 +85,7 @@ where
         let _ = renderer.set_content(
             ids[1],
             layer,
-            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+            Some(ContentOp::Replace(crate::Picture::from_list(list.clone()))),
         );
         let incremental = render(renderer, &mut frames, ids[0], &tree, size, time);
         let full = render(renderer, &mut frames, ids[1], &tree, size, time);
@@ -169,7 +169,7 @@ where
         let _ = renderer.set_content(
             id,
             layer,
-            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+            Some(ContentOp::Replace(crate::Picture::from_list(list.clone()))),
         );
         let _ = renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
     }
@@ -201,7 +201,7 @@ where
         let _ = renderer.set_content(
             ids[1],
             layer,
-            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+            Some(ContentOp::Replace(crate::Picture::from_list(list.clone()))),
         );
         let incremental = render(renderer, &mut frames, ids[0], &tree, size, time).await;
         let full = render(renderer, &mut frames, ids[1], &tree, size, time).await;

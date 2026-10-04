@@ -75,12 +75,13 @@ fn sample(
     frame: ExternalFrame,
 ) -> Result<[f32; 4], Box<dyn std::error::Error>> {
     let layer = surface.layer();
-    let content = engine.external_frame(frame);
+    let (video, sink) = engine.frame_producer();
+    sink.submit(frame);
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
         tx[&layer]
             .transform(Affine::translate((2.0, 2.0)))
-            .content(content);
+            .content(video.at((4, 4)));
     });
     engine.render(FrameTime::now())?;
     let rb = surface.readback()?;

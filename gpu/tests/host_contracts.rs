@@ -275,7 +275,8 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
 
     // External video planes on the same device, sampled in place.
     let (y, uv) = nv12_planes(&device, &queue);
-    let video = engine.external_frame(ExternalFrame::yuv(y, uv, FrameColor::BT709_VIDEO)?);
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::yuv(y, uv, FrameColor::BT709_VIDEO)?);
     let video_layer = surface.layer();
 
     surface.update(|tx| {
@@ -285,10 +286,10 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
             .clip(Rect::new(0.0, 0.0, 4.0, 4.0))
             .opacity(0.5_f32)
             .filter(&effect)
-            .content(engine.gpu_content((8, 8), content));
+            .content(engine.gpu_producer(content).at((8, 8)));
         tx[&video_layer]
             .transform(cherenkov::kurbo::Affine::translate((8.0, 8.0)))
-            .content(video);
+            .content(video.at((8, 8)));
     });
 
     assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);

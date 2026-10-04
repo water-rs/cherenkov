@@ -78,7 +78,8 @@ mod macos {
     /// The surface in device pixels, its scale, and the video in pixels.
     const SIZE: (u32, u32) = (96, 64);
     const SCALE: f64 = 2.0;
-    const VIDEO: (usize, usize) = (48, 32);
+    const VIDEO_SIZE: (u32, u32) = (48, 32);
+    const VIDEO: (usize, usize) = (VIDEO_SIZE.0 as usize, VIDEO_SIZE.1 as usize);
 
     pub fn trials() -> Vec<Trial> {
         let case = |name: &str, run: fn()| {
@@ -845,7 +846,7 @@ mod macos {
                 .clip(RoundedRect::new(0.0, 0.0, 72.0, 48.0, 6.0));
             tx[&player]
                 .transform(Affine::scale(1.5))
-                .content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
+                .content(video.at(VIDEO_SIZE));
             tx[&above].content(bar).clip(bar_rect);
         });
         [below, holder, player, above]
@@ -1305,7 +1306,7 @@ mod macos {
         sink.submit(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
         fixture.window.update(|tx| {
             tx[fixture.window.root()].push(&video);
-            tx[&video].content(video_prod.at((VIDEO.0 as u32, VIDEO.1 as u32)));
+            tx[&video].content(video_prod.at(VIDEO_SIZE));
         });
         assert!(
             fixture.promote(),
@@ -1479,13 +1480,24 @@ mod macos {
             }),
             || {},
         ));
+        // The window is opaque, so its bottom engine part shows black
+        // where nothing is drawn while the offscreen stays transparent; an
+        // opaque backdrop gives both the same pixels outside the video.
         let layer = |surface: &Surface<Gpu>| {
+            let backdrop = surface.layer();
             let layer = surface.layer();
-            surface.update(|tx| {
-                tx[surface.root()].push(&layer);
-                tx[&layer].content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
+            let fill = surface.record(|c| {
+                c.fill(
+                    Rect::new(0.0, 0.0, f64::from(SIZE.0), f64::from(SIZE.1)),
+                    WorkingColor::new([0.1, 0.3, 0.6, 1.0]),
+                );
             });
-            layer
+            surface.update(|tx| {
+                tx[surface.root()].push(&backdrop).push(&layer);
+                tx[&backdrop].content(fill);
+                tx[&layer].content(video.at(VIDEO_SIZE));
+            });
+            [backdrop, layer]
         };
         let _window_layer = layer(&fixture.window);
         let offscreen = fixture
@@ -1607,10 +1619,8 @@ mod macos {
         fixture.window.update(|tx| {
             tx[fixture.window.root()].push(&layer);
             tx[&layer]
-                .transform(Affine::scale(
-                    f64::from(SIZE.0) / f64::from(u32::try_from(VIDEO.0).expect("fits")),
-                ))
-                .content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
+                .transform(Affine::scale(f64::from(SIZE.0) / f64::from(VIDEO_SIZE.0)))
+                .content(video.at(VIDEO_SIZE));
         });
         assert!(
             fixture.promote(),
@@ -1642,12 +1652,9 @@ mod macos {
                 tx[&layer]
                     .transform(
                         Affine::translate((x, 0.0))
-                            * Affine::scale(
-                                f64::from(SIZE.0 / 2)
-                                    / f64::from(u32::try_from(VIDEO.0).expect("fits")),
-                            ),
+                            * Affine::scale(f64::from(SIZE.0 / 2) / f64::from(VIDEO_SIZE.0)),
                     )
-                    .content(video.at((VIDEO.0 as u32, VIDEO.1 as u32)));
+                    .content(video.at(VIDEO_SIZE));
             });
             layer
         };

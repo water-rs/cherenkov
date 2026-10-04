@@ -31,7 +31,7 @@ pub struct Ring {
 /// One scan-out buffer and its release baseline.
 struct Buffer {
     /// The `IOSurface`-backed, scan-out-capable texture.
-    buffer: raster::Buffer,
+    raster: raster::Buffer,
     /// Its sampled view.
     view: wgpu::TextureView,
     /// The surface's retain count while nothing outside the engine
@@ -44,12 +44,12 @@ impl Buffer {
     fn new(device: &wgpu::Device, size: (u32, u32), generation: u64) -> Result<Self, RenderError> {
         // Headroom 1.0: display headroom belongs to the static-capture
         // path, not to a producer frame.
-        let buffer = raster::Buffer::new(device, size, generation, 1.0)?;
-        let view = buffer
+        let raster = raster::Buffer::new(device, size, generation, 1.0)?;
+        let view = raster
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let free = buffer.surface.retain_count();
-        Ok(Self { buffer, view, free })
+        let free = raster.surface.retain_count();
+        Ok(Self { raster, view, free })
     }
 
     /// Whether something outside the engine still retains the buffer's
@@ -65,7 +65,7 @@ impl Buffer {
     /// every produce past the pool's depth. A retain above the `free`
     /// baseline is the hold that must never be drawn into.
     fn held(&self) -> bool {
-        self.buffer.surface.retain_count() > self.free
+        self.raster.surface.retain_count() > self.free
     }
 }
 
@@ -81,7 +81,7 @@ impl Ring {
     pub fn bytes(&self) -> u64 {
         self.buffers
             .iter()
-            .map(|buffer| raster::Buffer::bytes(&buffer.buffer))
+            .map(|buffer| raster::Buffer::bytes(&buffer.raster))
             .sum()
     }
 
@@ -121,7 +121,7 @@ impl Ring {
             let buffer = &self.buffers[index];
             if !buffer.held() {
                 return Ok(Some(RingBuffer {
-                    texture: &buffer.buffer.texture,
+                    texture: &buffer.raster.texture,
                     view: &buffer.view,
                     version: identity(self.version, index),
                 }));
@@ -165,7 +165,7 @@ mod tests {
         let held: Vec<_> = ring
             .buffers
             .iter()
-            .map(|buffer| buffer.buffer.surface.clone())
+            .map(|buffer| buffer.raster.surface.clone())
             .collect();
         for _ in 0..DEPTH {
             assert!(

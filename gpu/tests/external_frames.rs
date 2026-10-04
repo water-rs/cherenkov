@@ -283,10 +283,11 @@ fn render(
     name: &str,
 ) -> Result<Vec<[f32; 4]>, Box<dyn std::error::Error>> {
     let layer = surface.layer();
-    let content = engine.external_frame(frame);
+    let (video, sink) = engine.frame_producer();
+    sink.submit(frame);
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(content);
+        tx[&layer].content(video.at((SIZE, SIZE)));
     });
     engine.render(FrameTime::now())?;
     let rb = surface.readback()?;
@@ -441,5 +442,62 @@ fn rgba_frame_decodes_in_place() -> Result<(), Box<dyn std::error::Error>> {
     let frame = ExternalFrame::rgb(rgb_plane, RgbAlpha::Opaque, color)?;
     let pixels = render(&engine, &surface, frame, "rgba")?;
     compare(&pixels, |x, y| rgb_expected(x, y, color.transfer), "rgba");
+    Ok(())
+}
+
+/// A solid-colour `SIZE`² RGBA8 frame; `rgba` is sRGB `R'G'B'A'`.
+fn solid(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba: [u8; 4],
+) -> Result<ExternalFrame, Box<dyn std::error::Error>> {
+    let data: Vec<u8> = (0..SIZE * SIZE).flat_map(|_| rgba).collect();
+    let plane = plane(
+        device,
+        queue,
+        SIZE,
+        SIZE,
+        wgpu::TextureFormat::Rgba8Unorm,
+        4,
+        &data,
+    );
+    Ok(ExternalFrame::rgb(
+        plane,
+        RgbAlpha::Opaque,
+        FrameColor {
+            transfer: Transfer::Linear,
+            ..FrameColor::SRGB
+        },
+    )?)
+}
+
+#[test]
+fn frame_producer_shows_each_submitted_frame_on_two_surfaces()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some((engine, device, queue)) = engine()? else {
+        return Ok(());
+    };
+    let first = engine.surface(Offscreen::new((SIZE, SIZE), OffscreenFormat::LinearF16))?;
+    let second = engine.surface(Offscreen::new((SIZE, SIZE), OffscreenFormat::LinearF16))?;
+    let a = first.layer();
+    let b = second.layer();
+    let (video, sink) = engine.frame_producer();
+    first.update(|tx| {
+        tx[first.root()].push(&a);
+        tx[&a].content(video.at((SIZE, SIZE)));
+    });
+    second.update(|tx| {
+        tx[second.root()].push(&b);
+        tx[&b].content(video.at((SIZE, SIZE)));
+    });
+    for rgba in [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]] {
+        sink.submit(solid(&device, &queue, rgba)?);
+        engine.render(FrameTime::now())?;
+        let [r, g, b, _] = rgba;
+        let expected = to_linear_p3([r, g, b].map(|c| f64::from(c) / 255.0));
+        for (name, surface) in [("first", &first), ("second", &second)] {
+            compare(&surface.readback()?.pixels, |_, _| expected, name);
+        }
+    }
     Ok(())
 }

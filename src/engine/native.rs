@@ -12,7 +12,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use crate::ShaderId;
 use crate::backend::{Backend, Renderer};
 use crate::capability::{
-    Effects, ExternalFrames, Filters, GpuContent, Runs, ShaderPaint, ShaderSource, Uploads,
+    DrainedProducer, Effects, Filters, GpuContent, Runs, ShaderPaint, ShaderSource, Uploads,
 };
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
@@ -20,12 +20,15 @@ use crate::frame::{FrameStats, FrameTime, FrameTiming, Next};
 use crate::glyph::FontId;
 use crate::image::{Format, ImageData};
 use crate::message::{
-    ChangeSet, FontData, MemoryReply, Message, RegisterOp, RenderReply, SurfaceId,
+    ChangeSet, FontData, MemoryReply, Message, ProducerId, RegisterOp, RenderReply, ResOp,
+    SurfaceId,
 };
 use crate::paint::ImageId;
-use crate::resource::{Filter, Font, FontSource, Image, ReplaceImage, ResourceId, Shader};
+use crate::resource::{
+    Filter, Font, FontSource, FrameSink, GpuProducer, Image, ReplaceImage, ResourceId, Shader,
+};
 use crate::style::FilterId;
-use crate::surface::{ExternalFrameHandle, GpuContentHandle, Shared, Surface};
+use crate::surface::{Shared, Surface};
 
 /// The engine: owns the device and the render thread. `!Send`, lives on
 /// the UI thread.
@@ -43,6 +46,11 @@ use crate::surface::{ExternalFrameHandle, GpuContentHandle, Shared, Surface};
 /// ```
 pub struct Engine<B: Backend> {
     tx: SyncSender<Message<B>>,
+    /// A producer's last `Arc` drop posts its retirement here — an
+    /// unbounded queue the render loop drains after each applied
+    /// message, so a drop on the render thread itself never blocks on
+    /// the bounded transaction channel.
+    retire: std::sync::mpsc::Sender<ResOp<B>>,
     info: B::Info,
     stats: RefCell<FrameStats>,
     render_reply: RefCell<Option<SyncSender<RenderReply<B>>>>,
@@ -59,6 +67,7 @@ pub struct Engine<B: Backend> {
     next_shader: Cell<u64>,
     next_filter: Cell<u64>,
     next_backdrop_shader: Cell<u64>,
+    next_producer: Cell<u64>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The type-erased sender resource drops use; a render thread that is
     /// gone has nothing left to release.
@@ -85,12 +94,13 @@ impl<B: Backend> Engine<B> {
     /// thread cannot start.
     pub fn new(config: B::Config) -> Result<Self, EngineError> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Message<B>>(64);
+        let (retire_tx, retire_rx) = std::sync::mpsc::channel::<ResOp<B>>();
         let (init_tx, init_rx) = std::sync::mpsc::channel();
         let (render_reply, render_reply_rx) = std::sync::mpsc::sync_channel(1);
         let (memory_reply, memory_reply_rx) = std::sync::mpsc::sync_channel(1);
         let render_thread = std::thread::Builder::new()
             .name("cherenkov-render".into())
-            .spawn(move || thread::run::<B>(config, &rx, &init_tx))
+            .spawn(move || thread::run::<B>(config, &rx, &retire_rx, &init_tx))
             .map_err(|e| EngineError::Thread(format!("spawn failed: {e}")))?;
         let info = init_rx
             .recv()
@@ -108,6 +118,7 @@ impl<B: Backend> Engine<B> {
         };
         Ok(Self {
             tx,
+            retire: retire_tx,
             info,
             stats: RefCell::new(FrameStats::default()),
             render_reply: RefCell::new(Some(render_reply)),
@@ -122,6 +133,7 @@ impl<B: Backend> Engine<B> {
             next_shader: Cell::new(1),
             next_filter: Cell::new(1),
             next_backdrop_shader: Cell::new(1),
+            next_producer: Cell::new(1),
             thread: Some(render_thread),
             post: Rc::new(move |message| {
                 let _ = post_tx.send(message);
@@ -495,29 +507,77 @@ impl<B: Filters> Engine<B> {
 }
 
 impl<B: GpuContent> Engine<B> {
-    /// Creates GPU content of `size` pixels, attachable to a layer with
-    /// [`LayerEdit::content`](crate::LayerEdit::content).
+    /// Registers a GPU producer the engine's surfaces bind with
+    /// [`GpuProducer::at`]. The handle is `Clone`; every clone of the one
+    /// view instance's producer shares its renderer state, and there is
+    /// no cache keyed by content — a second call is a second producer.
+    /// The last drop retires it through the producer's own queue.
     #[must_use]
-    pub fn gpu_content(
-        &self,
-        size: (u32, u32),
-        content: impl Into<B::Content>,
-    ) -> GpuContentHandle<B> {
-        GpuContentHandle {
-            size,
-            content: content.into(),
-        }
+    pub fn gpu_producer(&self, content: impl Into<B::Content>) -> GpuProducer<B> {
+        let id = ProducerId::new(Self::alloc(&self.next_producer));
+        let content = content.into();
+        (self.post)(Message::Resource(Box::new(move |r: &mut B::Renderer| {
+            B::add_gpu_producer(r, id, content);
+        })));
+        GpuProducer::new(id, self.retire.clone())
     }
-}
 
-impl<B: ExternalFrames> Engine<B> {
-    /// Wraps an externally produced frame, attachable to a layer with
-    /// [`LayerEdit::content`](crate::LayerEdit::content).
+    /// Creates a submitted-frame producer — one whose frames come from
+    /// the returned [`FrameSink`] instead of a `GpuContent` render — and
+    /// its [`GpuProducer`] for binding it to layers with
+    /// [`GpuProducer::at`].
+    ///
+    /// The producer has no setup and holds no content: its current frame
+    /// is whatever the sink last submitted, on the device it was
+    /// submitted to. A device replacement drops that frame; the next
+    /// [`FrameSink::submit`] supplies one on the new device.
     #[must_use]
-    pub fn external_frame(&self, frame: impl Into<B::Frame>) -> ExternalFrameHandle<B> {
-        ExternalFrameHandle {
-            frame: frame.into(),
-        }
+    pub fn frame_producer(&self) -> (GpuProducer<B>, FrameSink<B>) {
+        let id = ProducerId::new(Self::alloc(&self.next_producer));
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = std::sync::Arc::new(crate::WakeGate::default());
+        (self.post)(Message::Resource(Box::new({
+            let dirty = std::sync::Arc::clone(&dirty);
+            let gate = std::sync::Arc::clone(&gate);
+            move |r: &mut B::Renderer| {
+                B::add_frame_producer(r, id, dirty, gate);
+            }
+        })));
+        let engine_waker = std::sync::Arc::clone(&self.waker);
+        (
+            GpuProducer::new(id, self.retire.clone()),
+            FrameSink::new(
+                id,
+                self.tx.clone(),
+                dirty,
+                gate,
+                std::sync::Arc::new(move || engine_waker.wake()),
+            ),
+        )
+    }
+
+    /// The device-replacement contract: drains every live producer, the
+    /// render loop dropping their device resources — current frames and
+    /// frame rings — and releasing their bindings. A device replacement
+    /// re-registers each rendered producer's content on a fresh renderer
+    /// ([`gpu_producer`](Self::gpu_producer)) and rebinds; the first drawn
+    /// binding then runs the producer's `setup` again on the new device.
+    /// A frame producer's frame is device state and drops with the old
+    /// device — recreate the pair with [`frame_producer`](Self::frame_producer)
+    /// and submit again.
+    ///
+    /// # Errors
+    /// [`RenderError::Thread`] when the render thread is gone.
+    pub fn drain_gpu_producers(
+        &self,
+    ) -> Result<Vec<(ProducerId, DrainedProducer<B>)>, RenderError> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Message::Resource(Box::new(move |r: &mut B::Renderer| {
+                let _ = reply.send(B::drain_gpu_producers(r));
+            })))
+            .map_err(|_| RenderError::Thread)?;
+        rx.recv().map_err(|_| RenderError::Thread)
     }
 }
 
@@ -533,8 +593,104 @@ impl<B: Backend> Drop for Engine<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Null, NullConfig};
+    use crate::testing::{Event, Null, NullConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A binding's last reference can die on the render thread — the
+    /// unbind a `clear_content` runs drops the `GpuProducer` clone the
+    /// binding held. With the bounded transaction channel saturated the
+    /// retirement must still land and the loop must not hang: it rides
+    /// the producer's own unbounded queue, never `tx`.
+    #[test]
+    fn a_render_thread_binding_drop_retires_without_hanging() {
+        let (events, rx) = std::sync::mpsc::channel();
+        let engine = Engine::<Null>::new(NullConfig {
+            events,
+            reject: std::collections::HashSet::default(),
+        })
+        .unwrap();
+        let surface = engine
+            .surface(crate::Offscreen::new(
+                (16, 16),
+                crate::OffscreenFormat::LinearF16,
+            ))
+            .unwrap();
+        surface.visibility(crate::Visibility::Hidden).unwrap();
+        let layer = surface.layer();
+        let producer = engine.gpu_producer(());
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer);
+            tx[&layer].content(producer.at((8, 8)));
+        });
+        // A hidden surface's ops go straight out as `Message::Apply`;
+        // BindProducer names the binding once it is installed on the
+        // render thread — the clone it holds is then the producer's
+        // only reference.
+        let id = producer.id();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(Event::BindProducer(_, _, bound)) if bound == id => break,
+                Ok(_) => {}
+                other => panic!("binding never installed: {other:?}"),
+            }
+        }
+        drop(producer);
+
+        // Park the render thread, queue the unbind behind it, then pin
+        // the bounded channel full so a blocking retire send from
+        // inside the render thread could never complete.
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        engine
+            .tx
+            .send(Message::Resource(Box::new(move |_| {
+                let _ = parked_rx.recv();
+            })))
+            .unwrap();
+        surface.update(|tx| {
+            tx[&layer].clear_content();
+        });
+        let stop = Arc::new(AtomicUsize::new(0));
+        let filler = std::thread::spawn({
+            let tx = engine.tx.clone();
+            let stop = Arc::clone(&stop);
+            move || {
+                while stop.load(Ordering::Relaxed) == 0
+                    && tx.send(Message::Resource(Box::new(|_| {}))).is_ok()
+                {}
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(parked_tx);
+
+        // The render thread drains: the Apply unbinds and drops the
+        // last clone — the retirement goes through the producer's
+        // unbounded queue even with `tx` pinned full. `RetireProducer`
+        // landing proves the loop never wedged on a blocking send.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(Event::RetireProducer(retired)) if retired == id => break,
+                _ => assert!(
+                    std::time::Instant::now() < deadline,
+                    "retirement never landed"
+                ),
+            }
+        }
+        // And the loop kept consuming: a transaction queued behind the
+        // saturation still applies.
+        surface.visibility(crate::Visibility::Visible).unwrap();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(Event::Visibility(_, crate::Visibility::Visible)) => break,
+                _ => assert!(
+                    std::time::Instant::now() < deadline,
+                    "render loop stopped consuming"
+                ),
+            }
+        }
+        stop.store(1, Ordering::Relaxed);
+        filler.join().unwrap();
+    }
 
     #[test]
     fn completion_before_render_reply_wakes_the_host() {

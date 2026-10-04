@@ -359,10 +359,9 @@ impl TryFrom<DisplayListData> for DisplayList {
 
 impl DisplayList {
     /// An empty list with room for `capacity` commands.
-    // Engine seam: the recorders and the engine's tests build lists.
-    #[doc(hidden)]
+    // The recorders build lists through this and `push`.
     #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             commands: Vec::with_capacity(capacity),
         }
@@ -408,9 +407,8 @@ impl DisplayList {
     /// Whether any command, including those of nested pictures, samples
     /// `resource`: a glyph run's font, an image draw, or an image or shader
     /// paint of a fill, stroke or glyph run. Content never names a backdrop
-    /// shader; layers sample those through the tree.
-    // Engine seam: a render target's resource-liveness bookkeeping.
-    #[doc(hidden)]
+    /// shader; layers sample those through the tree. A render target's
+    /// resource-liveness bookkeeping.
     #[must_use]
     pub fn references(&self, resource: ResourceId) -> bool {
         self.commands.iter().any(|command| match command {
@@ -555,9 +553,8 @@ impl DisplayList {
         })
     }
 
-    // Engine seam: the recorders append through this.
-    #[doc(hidden)]
-    pub fn push(&mut self, command: Command) -> u32 {
+    // The recorders append through this.
+    pub(crate) fn push(&mut self, command: Command) -> u32 {
         let index = u32::try_from(self.commands.len())
             .expect("a display list holds at most u32::MAX commands");
         self.commands.push(command);
@@ -766,10 +763,9 @@ impl ExactSizeIterator for Operands<'_> {}
 pub struct Picture(Arc<DisplayList>);
 
 impl Picture {
-    // Engine seam: a picture the engine builds from a finished list.
-    #[doc(hidden)]
+    /// A picture over a finished list.
     #[must_use]
-    pub fn new(list: DisplayList) -> Self {
+    pub fn from_list(list: DisplayList) -> Self {
         Self(Arc::new(list))
     }
 
@@ -781,10 +777,10 @@ impl Picture {
         *Arc::get_mut(&mut self.0).expect("picture must be unique") = list;
     }
 
-    // Engine seam: the render thread clears a picture its replacement
-    // recycled.
-    #[doc(hidden)]
-    pub fn clear_unique(&mut self) -> bool {
+    /// Clears the picture for storage reuse, returning `true` only when
+    /// this is the last reference: a shared picture is left intact and
+    /// its storage stays with the other references.
+    pub fn try_recycle(&mut self) -> bool {
         let Some(list) = Arc::get_mut(&mut self.0) else {
             return false;
         };
@@ -1037,14 +1033,14 @@ mod tests {
     fn clearing_a_unique_picture_keeps_its_command_buffer() {
         let mut list = DisplayList::with_capacity(2);
         list.push(Command::End);
-        let mut picture = Picture::new(list);
+        let mut picture = Picture::from_list(list);
         let shared = picture.clone();
         let pointer = picture.display_list().commands().as_ptr();
 
-        assert!(!picture.clear_unique());
+        assert!(!picture.try_recycle());
         assert_eq!(shared.display_list().len(), 1);
         drop(shared);
-        assert!(picture.clear_unique());
+        assert!(picture.try_recycle());
         assert!(picture.display_list().is_empty());
         assert_eq!(picture.display_list().commands().as_ptr(), pointer);
     }

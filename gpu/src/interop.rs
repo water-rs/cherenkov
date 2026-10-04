@@ -65,13 +65,17 @@ pub mod wgpu {
 /// A producer moved to the engine's render thread for its entire lifetime.
 /// UI-thread-bound producers send owned frame data over a channel to this object.
 pub trait GpuContent: cherenkov::RenderTransfer + 'static {
-    /// Creates persistent resources once before the first frame.
+    /// Creates persistent resources before the first frame the producer
+    /// draws. May run more than once — on a new device each time — and
+    /// each run replaces every device resource it created before; a
+    /// device replacement drains the producers, hands them to the new
+    /// renderer, and their first drawn binding runs `setup` there.
     fn setup(&mut self, context: &wgpu::Context<'_>) -> impl Future<Output = ()>;
     /// Draws into the provided engine-owned attachment.
     fn render(&mut self, frame: &mut wgpu::Frame<'_>);
 }
 
-/// A producer boxed for `Engine::gpu_content`.
+/// A producer boxed for `Engine::gpu_producer`.
 pub struct GpuContentBox {
     pub(crate) content: Box<dyn Content>,
     pub(crate) redraw: RedrawHandle,

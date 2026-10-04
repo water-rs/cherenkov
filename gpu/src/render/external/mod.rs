@@ -498,6 +498,19 @@ impl Slot {
         }
     }
 
+    /// Replaces the frame the slot draws, keeping the views, params
+    /// buffer and binds: the planes live in the same buffer — the ring
+    /// buffer a rendered producer draws into every frame — and only the
+    /// frame's contents and its hand-off generation changed. Params are
+    /// identical by contract, so the uniform stays as baked.
+    ///
+    /// A different-buffer replacement is a new [`Slot`](Self::new):
+    /// dropping the old slot releases the lease the planes retire on.
+    pub fn swap_frame(&mut self, frame: ExternalFrame, generation: u64) {
+        self.frame = frame;
+        self.generation = generation;
+    }
+
     /// The native generation when the slot draws in the Vulkan native
     /// operation (`Planes` and `ExternalFormat` representations). An
     /// RGB-repr native frame binds its wrapped plane on the ordinary

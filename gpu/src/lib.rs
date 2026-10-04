@@ -455,43 +455,59 @@ impl cherenkov::Planes for Gpu {}
 
 impl cherenkov::ProjectiveLayers for Gpu {}
 
+// GPU producers (#268): a `GpuProducer` lives at renderer scope, so its
+// bindings can sit on any surface of the engine — a persistent surface
+// and a transient capture target share the one current frame. Rendered
+// and submitted pixels take one path: either kind's bindings sample the
+// producer's current `ExternalFrame` through the external pipeline
+// (`render::external`, `render::external.wgsl`).
 impl cherenkov::GpuContent for Gpu {
     type Content = interop::GpuContentBox;
-    fn set_gpu_content(
-        r: &mut Self::Renderer,
-        surface: cherenkov::SurfaceId,
-        layer: cherenkov::LayerId,
-        size: (u32, u32),
-        content: Self::Content,
-    ) {
-        r.set_gpu_content(surface, layer, size, content);
-    }
-    fn resize_gpu_content(
-        r: &mut Self::Renderer,
-        surface: cherenkov::SurfaceId,
-        layer: cherenkov::LayerId,
-        size: (u32, u32),
-    ) {
-        r.resize_gpu_content(surface, layer, size);
-    }
-}
-
-// External frames (#165): retained producer planes sampled in place — no
-// copy, no raster path — decoded and converted into the working space in
-// the external fragment pipeline; see `render::external` and
-// `render::external.wgsl`.
-impl cherenkov::ExternalFrames for Gpu {
     type Frame = interop::ExternalFrame;
+
     fn frame_opaque(frame: &Self::Frame) -> bool {
         frame.alpha() == interop::RgbAlpha::Opaque
     }
-    fn set_external_frame(
+
+    fn add_gpu_producer(r: &mut Self::Renderer, id: cherenkov::ProducerId, content: Self::Content) {
+        r.add_gpu_producer(id, content);
+    }
+
+    fn add_frame_producer(
+        r: &mut Self::Renderer,
+        id: cherenkov::ProducerId,
+        dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        gate: std::sync::Arc<cherenkov::WakeGate>,
+    ) {
+        r.add_frame_producer(id, dirty, gate);
+    }
+
+    fn bind_gpu_producer(
         r: &mut Self::Renderer,
         surface: cherenkov::SurfaceId,
         layer: cherenkov::LayerId,
+        producer: &cherenkov::GpuProducer<Self>,
+        size: (u32, u32),
+    ) -> Option<bool> {
+        r.bind_gpu_producer(surface, layer, producer, size)
+    }
+
+    fn submit_frame(
+        r: &mut Self::Renderer,
+        id: cherenkov::ProducerId,
         frame: Self::Frame,
-    ) {
-        r.set_external_frame(surface, layer, frame);
+    ) -> Vec<(cherenkov::SurfaceId, cherenkov::LayerId)> {
+        r.submit_frame(id, frame)
+    }
+
+    fn retire_gpu_producer(r: &mut Self::Renderer, id: cherenkov::ProducerId) {
+        r.retire_gpu_producer(id);
+    }
+
+    fn drain_gpu_producers(
+        r: &mut Self::Renderer,
+    ) -> Vec<(cherenkov::ProducerId, cherenkov::DrainedProducer<Self>)> {
+        r.drain_gpu_producers()
     }
 }
 

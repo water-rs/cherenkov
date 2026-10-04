@@ -840,10 +840,11 @@ fn nv12_plane_views_decode_in_place() {
     let surface = engine.surface(target).expect("surface");
     let output = textures.try_recv().expect("output texture");
     let layer = surface.layer();
-    let handle = engine.external_frame(external);
+    let (video, sink) = engine.frame_producer();
+    sink.submit(external);
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     render_twice(&engine);
     let pixels = read_pixels(&engine, &shared, &output).expect("readback");
@@ -879,10 +880,11 @@ fn same_device_rgb_wrap_decodes_in_place() {
     let surface = engine.surface(target).expect("surface");
     let output = textures.try_recv().expect("output texture");
     let layer = surface.layer();
-    let handle = engine.external_frame(external);
+    let (video, sink) = engine.frame_producer();
+    sink.submit(external);
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     render_twice(&engine);
     let pixels = read_pixels(&engine, &shared, &output).expect("readback");
@@ -921,16 +923,16 @@ fn shared_acquisition_state_dedup_and_retention() {
     let (target, _) = TextureTarget::new((16, 16));
     let surface = engine.surface(target).expect("surface");
     let (a, b) = (surface.layer(), surface.layer());
-    let (ha, hb) = (
-        engine.external_frame(external_a),
-        engine.external_frame(external_b),
-    );
+    let (pa, sa) = engine.frame_producer();
+    sa.submit(external_a);
+    let (pb, sb) = engine.frame_producer();
+    sb.submit(external_b);
     surface.update(|tx| {
         tx[surface.root()].push(&a).push(&b);
-        tx[&a].content(ha);
+        tx[&a].content(pa.at((8, 8)));
         tx[&b]
             .transform(cherenkov::kurbo::Affine::translate((4.0, 0.0)))
-            .content(hb);
+            .content(pb.at((8, 8)));
     });
     // Both attachments share one generation record: the first render
     // acquires once, and every later render is a plain retained draw.
@@ -951,12 +953,13 @@ fn shared_acquisition_state_dedup_and_retention() {
         "two slots lease the one generation"
     );
     // Detaching one layer keeps the generation live; detaching the last
-    // retires it.
-    // The handle is inert; the layer's slot holds the lease.
+    // retires it. The producer's slot holds the lease: it dies when the
+    // producer's last clone does, which is the retirement.
     surface.update(|tx| {
         tx[surface.root()].remove(&a);
     });
     drop(a);
+    drop(pa);
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     assert_eq!(
         generation.leases.load(Ordering::Relaxed),
@@ -967,9 +970,9 @@ fn shared_acquisition_state_dedup_and_retention() {
         tx[surface.root()].remove(&b);
     });
     drop(b);
+    drop(pb);
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     assert_eq!(generation.leases.load(Ordering::Relaxed), 0);
-    // `hb` was consumed by the layer update; nothing remains to drop.
     let state = *generation.state.lock().expect("state");
     assert!(
         matches!(
@@ -1028,10 +1031,11 @@ fn delayed_timeline_signal_stays_on_gpu() {
     let (target, _) = TextureTarget::new((16, 16));
     let surface = engine.surface(target).expect("surface");
     let layer = surface.layer();
-    let handle = engine.external_frame(external);
+    let (video, sink) = engine.frame_producer();
+    sink.submit(external);
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     // The wait point is genuinely unsignalled when this render runs:
     // nothing on the host signals it, so a CPU-waiting engine could not
@@ -1056,7 +1060,9 @@ fn delayed_timeline_signal_stays_on_gpu() {
     // submits it behind the consuming submission on the one queue, so
     // the semaphore reaching the release point proves the timeline wait
     // executed on the GPU — without the wait, this point never arrives.
+    // The frame lives on the producer: the last clone's drop retires it.
     drop(surface);
+    drop(video);
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     let released = unsafe {
         dev.wait_semaphores(

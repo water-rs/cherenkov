@@ -37,10 +37,9 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 | `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | filters with a CPU kernel |
 | `Backdrop`, `BackdropRuns<K, F>` for a backdrop chain `F` | every chain | chains with a CPU kernel |
 | `HdrOutput` | tone-mapped extended output | |
-| `ExternalFrames` | external frames | |
 | `Planes` | Apple window surfaces | |
 
-Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>` and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
+Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>` and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
 The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
@@ -147,8 +146,17 @@ pub trait Renderer: 'static {
   pub trait Filters: Backend { fn remove_filter(r: &mut Self::Renderer, id: FilterId); }
   pub trait Runs<F: filtrate_core::Filter + Send>: Filters { fn add_filter(r: &mut Self::Renderer, id: FilterId, filter: F); }
   pub trait Effects: Filters { type Effect: Send + 'static; fn add_effect(r: &mut Self::Renderer, id: FilterId, effect: Self::Effect); } // Box<dyn filtrate::Effect + Send> on GPU backends
-  pub trait GpuContent: Backend { type Content: Send + 'static; fn set_gpu_content(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, size: (u32, u32), content: Self::Content); }
-  pub trait ExternalFrames: Backend { type Frame: Send + 'static; fn frame_opaque(frame: &Self::Frame) -> bool; fn set_external_frame(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, frame: Self::Frame); }
+  pub trait GpuContent: Backend {
+      type Content: RenderTransfer + 'static;             // rendered producer payload
+      type Frame: RenderTransfer + 'static;              // submitted-frame payload (ExternalFrame on Gpu)
+      fn frame_opaque(frame: &Self::Frame) -> bool;
+      fn add_gpu_producer(r: &mut Self::Renderer, id: ProducerId, content: Self::Content);
+      fn add_frame_producer(r: &mut Self::Renderer, id: ProducerId, dirty: Arc<AtomicBool>, gate: Arc<WakeGate>);
+      fn bind_gpu_producer(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, producer: GpuProducer<Self>, size: (u32, u32)) -> Option<bool>;   // current frame's declared alpha, None before the first
+      fn submit_frame(r: &mut Self::Renderer, id: ProducerId, frame: Self::Frame) -> Vec<(SurfaceId, LayerId)>;
+      fn retire_gpu_producer(r: &mut Self::Renderer, id: ProducerId);
+      fn drain_gpu_producers(r: &mut Self::Renderer) -> Vec<(ProducerId, DrainedProducer<Self>)>;   // device replacement
+  }
   pub trait Uploads<F: Format>: Backend {}      // which image storage formats `add_image` accepts
   pub trait Backdrop: Backend {               // unfiltered groups: `surface.backdrop_group_unfiltered`
       fn add_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
@@ -162,7 +170,7 @@ pub trait Renderer: 'static {
   pub trait Planes: Backend {}
   ```
 
-  The `Engine`/`Transaction` methods bounded by these traits (`engine.shader`, `engine.filter`, `engine.gpu_content`, `tx[&l].content(gpu)`, `engine.image::<Astc4x4>`) wrap the hook into an owned `FnOnce(&mut B::Renderer) + Send` op that travels in the commit with the layer ops, in order. The `Renderer` core trait therefore has no shader, filter or GPU-content methods at all.
+  The `Engine`/`Transaction` methods bounded by these traits (`engine.shader`, `engine.filter`, `engine.gpu_producer`, `tx[&l].content(producer.at(size))`, `engine.image::<Astc4x4>`) wrap the hook into an owned `FnOnce(&mut B::Renderer) + Send` op that travels in the commit with the layer ops, in order. The `Renderer` core trait therefore has no shader, filter or GPU-producer methods at all.
 - **Resource lifetime.** Handles (`Font`, `Image<F>`, `Shader`, `BackdropShader`, `Filter`) are `Clone` over an `Rc`; the last drop queues the release, ordered with every render. For a font, image, shader or backdrop shader the render loop, not the host, owns the invariant that a resource is freed only once no surface's installed content draws it (see Resources). The backend frees the GPU copy when the release is carried out (deferred to after in-flight frames where the API needs it). The same `Rc` carries the ops a kind queues while it lives: an `Image<F>` queues `replace_image` through it.
 - **Errors.** `init` failures surface from `Engine::new` as `EngineError`. Surface creation errors are returned from `engine.surface`. Render errors fail that `render` call. Resource validation that does not need the device (font parsing, byte lengths, shader validation) runs on the UI thread before any message is sent and returns `ResourceError`; a rejection only the backend can detect fails the renders that draw the resource with `RenderError::Rejected` (see Resources).
 
@@ -285,7 +293,7 @@ drop(card);                                      // removed at the next commit
 - **Layout size.** `tx[&layer].layout_size(size)` is the size the host lays the layer out at, in its content coordinates (`Size::ZERO` until set); the host drives it from layout with a constant or a signal. It is UI-thread state that recordings read, not a render-thread property: it changes when the call is made, so a recording later in the same transaction already sees it, and `.animation(...)` does not apply to it. See Recording.
 - **Binding.** `transform`, `opacity`, `scroll_offset` and `clip` take `impl Into<Live<T>>`, the same target the `Recorder` uses: any `Signal<Output = T>`, and constants are signals. Binding a property replaces that property's previous subscription. A change fires on the UI thread, is queued as the same owned op a transaction would produce, reaches the render thread with the next frame, and calls the waker. If the change's nami `Context` metadata carries an `Animation`, the op carries it too and the render thread interpolates; otherwise the value snaps. A transaction that sets the property again also replaces the binding.
 - **Stable identity.** The layer handle is the identity. Content versions are internal: setting `content` bumps the version, and caching keys on (layer, version).
-- **Content kinds:** recorded `Content`, a shared `Picture`, `ExternalFrame` (video, web views), `GpuContent` (custom GPU pipelines).
+- **Content kinds:** recorded `Content`, a shared `Picture`, and `GpuProducer` bindings — rendered producers (custom GPU pipelines: `engine.gpu_producer(GpuContentBox)` returns a `Clone` handle owned by the one view instance) and submitted-frame producers (video, web views: `engine.frame_producer()` returns a `GpuProducer` + `FrameSink` pair; `sink.submit(frame)` installs each `ExternalFrame` and wakes the host while a binding is visible, and a frame producer has no setup). `producer.at(size)` binds a layer at the pixel size it needs; bindings of one producer across the engine's surfaces share its current frame — a rendered producer draws into a buffer from the renderer-owned frame ring, sized to the largest binding and rendered at most once per frame — and `ImageSource::Content` samples it, so there is no separate attachment path. The last drop retires the producer through the transaction stream, and `engine.drain_gpu_producers()` hands every live producer to a device replacement: a rendered producer's content re-registers and runs `setup` again, a frame producer's next submit supplies the frame on the new device.
 
 ## Animation
 
@@ -552,14 +560,17 @@ tx[&tab_bar].backdrop(glass.sample()); // plain bilinear sample of the shared ca
 // device, promoted to hardware overlays when eligible.
 let frame = ExternalFrame::yuv(luma, chroma, FrameColor::BT2020_PQ)?
     .sync(FrameSync::Metal { event, value });
-tx[&player].content(engine.external_frame(frame));
+let (video, sink) = engine.frame_producer();
+sink.submit(frame);
+tx[&player].content(video.at((width, height)));
 
 // Custom GPU pipelines (particles): GPU backend only.
 impl GpuContent for Particles {
     async fn setup(&mut self, gpu: &interop::wgpu::Context<'_>) { /* … */ }
     fn render(&mut self, frame: &mut interop::wgpu::Frame<'_>) { /* … */ }
 }
-tx[&sparks].content(GpuContentHandle::new(Particles::new()));
+let sparks = engine.gpu_producer(GpuContentBox::new(Particles::new(), wake_redraw));
+tx[&sparks_layer].content(sparks.at((width, height)));
 ```
 
 - **The engine does YUV conversion and tone mapping** for external frames when it composites them itself.

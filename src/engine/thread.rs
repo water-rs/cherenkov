@@ -329,10 +329,18 @@ fn samples_backdrop_shader(tree: &SurfaceTree, id: BackdropShaderId) -> bool {
 
 /// The render loop: runs on the `"cherenkov-render"` thread until
 /// [`Message::Shutdown`] or channel disconnect.
+///
+/// `retire_rx` carries producer retirements on their own unbounded
+/// queue — a binding's last handle can die inside this thread's own
+/// work (`unbind`, surface destroy, `drain_gpu_producers`), and a
+/// retirement sent on the bounded `rx` channel would block this loop
+/// on a channel it alone drains. The queue drains after each applied
+/// message.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run<B: Backend>(
     config: B::Config,
     rx: &Receiver<Message<B>>,
+    retire_rx: &Receiver<crate::message::ResOp<B>>,
     init_reply: &Sender<Result<B::Info, EngineError>>,
 ) {
     let (mut renderer, info) = match B::init(config) {
@@ -374,6 +382,9 @@ pub fn run<B: Backend>(
                 set_visibility::<B>(&mut renderer, &mut surfaces, id, visibility);
             }
             Message::Resource(op) => op(&mut renderer),
+            Message::ProducerFrame { opaque, apply, .. } => {
+                producer_frame::<B>(&mut renderer, &mut surfaces, opaque, apply);
+            }
             Message::Register { resource, op } => {
                 resources.register(resource, op(&mut renderer));
             }
@@ -383,15 +394,13 @@ pub fn run<B: Backend>(
             Message::ReplaceImage { id, image } => {
                 replace_image::<B>(&mut renderer, &mut surfaces, &mut resources, id, image);
             }
-            Message::Apply { id, mut changes } => {
-                apply_hidden::<B>(
-                    &mut renderer,
-                    &mut surfaces,
-                    &mut resources,
-                    id,
-                    &mut changes,
-                );
-            }
+            Message::Apply { id, mut changes } => apply_hidden::<B>(
+                &mut renderer,
+                &mut surfaces,
+                &mut resources,
+                id,
+                &mut changes,
+            ),
             Message::Render {
                 time,
                 mut commits,
@@ -407,6 +416,8 @@ pub fn run<B: Backend>(
                     time.0,
                     &mut commits,
                 );
+                // This frame's queued retirements belong to its batch.
+                drain_retire::<B>(retire_rx, &mut renderer);
                 let sender = reply.clone();
                 let _ = sender.send(crate::message::RenderReply {
                     result,
@@ -429,6 +440,35 @@ pub fn run<B: Backend>(
             }
             Message::Trim(pressure) => renderer.trim(pressure),
             Message::Shutdown => break,
+        }
+        drain_retire::<B>(retire_rx, &mut renderer);
+    }
+}
+
+/// Applies every queued producer retirement (`thread::run`'s `retire_rx`
+/// drain after each applied message).
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_retire<B: Backend>(rx: &Receiver<crate::message::ResOp<B>>, renderer: &mut B::Renderer) {
+    while let Ok(retire) = rx.try_recv() {
+        retire(renderer);
+    }
+}
+
+/// The submitted frame applied on the renderer names the layers it lands
+/// on; each gets the frame's declared alpha contract noted and counts as
+/// a frame swap — a planes-capable backend presents those alone when they
+/// are the surface's only change (#90).
+fn producer_frame<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    opaque: bool,
+    apply: crate::message::ProducerApply<B>,
+) {
+    for (surface, layer) in apply(renderer) {
+        if let Some(state) = surfaces.get_mut(&surface) {
+            state.tree.note_installed(layer, opaque);
+            state.commits = state.commits.max(Commits::Installs);
+            state.plane_frames.insert(layer);
         }
     }
 }
@@ -635,7 +675,7 @@ fn commit<B: Backend>(
                 state.tree.apply(LayerOp::Content(layer, None));
                 state.tree.note_content(layer, content.as_ref());
                 if let Some(mut old) = renderer.set_content(surface, layer, content)
-                    && old.clear_unique()
+                    && old.try_recycle()
                 {
                     recycled.push((layer, old));
                 }
@@ -644,27 +684,13 @@ fn commit<B: Backend>(
                 state.commits = Commits::Other;
                 state.tree.apply(op);
             }
-            Op::Installed(layer) => {
+            Op::Install(layer, install) => {
                 state.commits = Commits::Other;
-                // An arbitrary install declares no alpha contract.
-                state.tree.note_installed(layer, false);
-            }
-            Op::Install(install) => {
-                state.commits = Commits::Other;
-                install(&mut *renderer);
-            }
-            Op::ExternalFrame {
-                layer,
-                opaque,
-                install,
-            } => {
-                // A frame swap is a change like any other — `commits`
-                // still rises from `Clean` — but it is recorded apart, so
-                // a backend with planes can tell a plane-only frame (#90).
-                install(&mut *renderer);
-                state.tree.note_installed(layer, opaque);
-                state.commits = state.commits.max(Commits::Installs);
-                state.plane_frames.insert(layer);
+                // The install reports its content's declared alpha —
+                // `None` before its first frame — noted on the layer.
+                state
+                    .tree
+                    .note_installed(layer, install(&mut *renderer).unwrap_or(false));
             }
         }
     }
@@ -882,14 +908,14 @@ async fn render_local<B: Backend>(
 #[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
 mod tests {
     use super::{Commits, Presentation, SurfaceState, commit};
-    use crate::WorkingColor;
     use crate::backend::Visibility;
     use crate::backend::{Backend, Display};
-    use crate::display_list::{Command, DisplayList, Picture};
+    use crate::display_list::{DisplayList, Picture};
     use crate::engine::{SurfaceWaker, Waker};
     use crate::message::{ChangeSet, ContentOp, LayerId, LayerOp, Op, SurfaceId};
     use crate::testing::{Null, NullConfig};
     use crate::tree::SurfaceTree;
+    use crate::{Draw, WorkingColor};
 
     #[test]
     fn caller_shared_picture_is_not_recycled() {
@@ -901,9 +927,9 @@ mod tests {
         .expect("null backend");
         let surface = SurfaceId::new(1);
         let layer = LayerId::new(0);
-        let mut list = DisplayList::with_capacity(1);
-        list.push(Command::End);
-        let caller_picture = Picture::new(list);
+        let caller_picture = Picture::record(|c| {
+            c.fill(crate::kurbo::Rect::new(0., 0., 1., 1.), WorkingColor::WHITE);
+        });
         let mut state = SurfaceState {
             tree: SurfaceTree::new(),
             size: (1, 1),
@@ -933,7 +959,9 @@ mod tests {
             clear: None,
             ops: vec![Op::Layer(LayerOp::Content(
                 layer,
-                Some(ContentOp::Picture(Picture::new(DisplayList::default()))),
+                Some(ContentOp::Picture(Picture::from_list(
+                    DisplayList::default(),
+                ))),
             ))],
             recycled: Vec::new(),
             animating: false,
@@ -1012,6 +1040,9 @@ impl<B: Backend> LocalState<B> {
                 set_visibility::<B>(renderer, surfaces, id, visibility);
             }
             Message::Resource(op) => op(renderer),
+            Message::ProducerFrame { opaque, apply, .. } => {
+                producer_frame::<B>(renderer, surfaces, opaque, apply);
+            }
             Message::Register { resource, op } => {
                 let result = op(renderer).await;
                 resources.register(resource, result);

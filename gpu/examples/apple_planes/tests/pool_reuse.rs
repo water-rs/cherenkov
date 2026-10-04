@@ -26,17 +26,17 @@ fn slots_drain_past_the_pool_depth() {
         .surface(Offscreen::new((480, 270), OffscreenFormat::LinearF16))
         .expect("offscreen surface");
     let video = surface.layer();
+    let (prod, sink) = engine.frame_producer();
     surface.update(|tx| {
         tx[surface.root()].push(&video);
-        tx[&video].transform(Affine::scale(0.25));
+        tx[&video]
+            .transform(Affine::scale(0.25))
+            .content(prod.at((1920, 1080)));
     });
     let mut produced = 0;
     for _ in 0..16 {
         if let Some(frame) = pool.produce() {
-            let handle = engine.external_frame(frame);
-            surface.update(|tx| {
-                tx[&video].content(handle);
-            });
+            sink.submit(frame);
             produced += 1;
         }
         engine.render(FrameTime::now()).expect("rendered");

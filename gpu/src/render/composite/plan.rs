@@ -259,7 +259,7 @@ impl ExecutionPlan {
                         PipelineKind::SrcOver | PipelineKind::Replace
                     ) || matches!(
                         range.image,
-                        Some(ImageSource::External(_) | ImageSource::Shader(_))
+                        Some(ImageSource::Content(_) | ImageSource::Shader(_))
                     )
                 })
             {

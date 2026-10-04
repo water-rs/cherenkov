@@ -549,10 +549,11 @@ fn ahb_rgb_import_decodes_known_pixels() {
     let surface = engine.surface(target).expect("surface");
     let output = textures.try_recv().expect("output texture");
     let layer = surface.layer();
-    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::native(frame).expect("external"));
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     let pixels = read_pixels(&engine, &shared, &output).expect("readback");
@@ -600,10 +601,11 @@ fn ahb_yuv_external_format_decodes_neutral() {
     let surface = engine.surface(target).expect("surface");
     let output = textures.try_recv().expect("output texture");
     let layer = surface.layer();
-    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::native(frame).expect("external"));
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     let pixels = read_pixels(&engine, &shared, &output).expect("readback");
@@ -638,9 +640,10 @@ fn ahb_on(
             hdr: HdrMetadata::default(),
         })))
         .expect("AHB import");
-    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::native(frame).expect("external"));
     surface.update(|tx| {
-        tx[layer].content(handle);
+        tx[layer].content(video.at((16, 16)));
     });
 }
 
@@ -781,15 +784,15 @@ fn two_layers_replace_retire_and_release_fence() {
     textures.try_recv().expect("output texture");
     let (a, b) = (surface.layer(), surface.layer());
     // Two attachments of one generation deduplicate the acquisition.
-    let (ha, hb) = (
-        engine.external_frame(ExternalFrame::native(frame.clone()).expect("a")),
-        engine.external_frame(ExternalFrame::native(frame.clone()).expect("b")),
-    );
+    let (pa, sa) = engine.frame_producer();
+    sa.submit(ExternalFrame::native(frame.clone()).expect("a"));
+    let (pb, sb) = engine.frame_producer();
+    sb.submit(ExternalFrame::native(frame.clone()).expect("b"));
     surface.update(|tx| {
         tx[surface.root()].push(&a);
         tx[surface.root()].push(&b);
-        tx[&a].content(ha);
-        tx[&b].content(hb);
+        tx[&a].content(pa.at((16, 16)));
+        tx[&b].content(pb.at((16, 16)));
     });
     for _ in 0..3 {
         assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
@@ -843,10 +846,11 @@ fn native_op_survives_engine_buffer_and_atlas_regrowth() {
     let surface = engine.surface(target).expect("surface");
     let output = textures.try_recv().expect("output texture");
     let layer = surface.layer();
-    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::native(frame).expect("external"));
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     // Regrow the engine's per-draw buffers: enough fills to exceed the
@@ -954,10 +958,11 @@ fn next_generation_after_release() {
     let surface = engine.surface(target).expect("surface");
     let output = textures.try_recv().expect("output texture");
     let layer = surface.layer();
-    let h2 = engine.external_frame(ExternalFrame::native(frame2).expect("external"));
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::native(frame2).expect("external"));
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(h2);
+        tx[&layer].content(video.at((16, 16)));
     });
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     let pixels = read_pixels(&engine, &shared, &output).expect("readback");
@@ -1025,10 +1030,11 @@ fn cancellation_and_teardown() {
     let (target, _) = TextureTarget::new((16, 16));
     let surface = engine.surface(target).expect("surface");
     let layer = surface.layer();
-    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::native(frame).expect("external"));
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     drop(engine);
@@ -1065,10 +1071,11 @@ fn report_counts_and_timings() {
     textures.try_recv().expect("output texture");
     let layer = surface.layer();
     let imported = frame.imported_bytes();
-    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    let (video, sink) = engine.frame_producer();
+    sink.submit(ExternalFrame::native(frame).expect("external"));
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
+        tx[&layer].content(video.at((16, 16)));
     });
     // Cold vs warm: the first render prepares pipeline state; the second
     // is steady-state.

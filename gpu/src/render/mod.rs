@@ -41,8 +41,8 @@ use crate::{
 use bitmap::BitmapKey;
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
-    FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
-    Redraw, RenderError, Renderer, ResourceError, ResourceId, SurfaceError, SurfaceFrame,
+    FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, ProducerId,
+    Readback, Redraw, RenderError, Renderer, ResourceError, ResourceId, SurfaceError, SurfaceFrame,
     SurfaceId, SurfaceInfo, Visibility,
 };
 use glyph::{Atlas, FontData, PendingRaster, PreparedFont};
@@ -273,9 +273,7 @@ struct SurfaceState {
     /// Engine parts above the first (`target` is part 0): one per promoted
     /// plane with layers painted above it, at the surface size.
     parts: Vec<(wgpu::Texture, wgpu::TextureView)>,
-    /// Counts external frames installed on this surface; each slot keeps
-    /// the count at its install, so a plane knows when its frame changed.
-    frames_installed: u64,
+    /// Texture-target hand-off: each rendered texture goes to the host.
     textures: Option<std::sync::mpsc::Sender<wgpu::Texture>>,
     refresh: cherenkov::RefreshRange,
     present_pending: bool,
@@ -298,9 +296,10 @@ struct SurfaceState {
     /// Backdrop groups registered on this surface by raw id.
     backdrop_groups: FxHashMap<u64, BackdropGroupState>,
     layers: FxHashMap<LayerId, ContentData>,
-    content: FxHashMap<LayerId, gpu_content::Slot>,
-    /// Retained external frames by layer (`cherenkov::ExternalFrames`).
-    external: FxHashMap<LayerId, external::Slot>,
+    /// GPU producer bindings by layer (`cherenkov::GpuContent`): a layer
+    /// binds one producer, a producer serves bindings on any surface,
+    /// and every binding samples the producer's current frame.
+    bindings: FxHashMap<LayerId, gpu_content::Binding>,
     shader_textures: FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// Image lifetimes and attachment assignment, before physical allocation.
@@ -414,6 +413,7 @@ impl SurfaceState {
         &self,
         filters: &filter::Registry,
         shaders: &paint::Registry,
+        producers: &FxHashMap<ProducerId, gpu_content::Producer>,
     ) -> FxHashSet<projective::LocalKey> {
         self.projective
             .iter()
@@ -422,10 +422,9 @@ impl SurfaceState {
                 e.deps.interop.is_some_and(|g| g != self.interop)
                     || e.deps.filters.iter().any(|f| filters.wants_redraw(*f))
                     || e.deps.images.iter().any(|image| match image {
-                        lower::ImageSource::Content(layer) => self
-                            .content
-                            .get(layer)
-                            .is_none_or(gpu_content::Slot::wants_redraw),
+                        lower::ImageSource::Content(id) => producers
+                            .get(id)
+                            .is_none_or(gpu_content::Producer::wants_redraw),
                         lower::ImageSource::Shader(key) => shaders.animated(key),
                         _ => false,
                     })
@@ -442,9 +441,10 @@ impl SurfaceState {
         &self,
         filters: &filter::Registry,
         shaders: &paint::Registry,
+        producers: &FxHashMap<ProducerId, gpu_content::Producer>,
     ) -> bool {
         !self.composed.is_empty() && {
-            let stale = self.stale_projective(filters, shaders);
+            let stale = self.stale_projective(filters, shaders, producers);
             self.composed.iter().any(|key| stale.contains(key))
         }
     }
@@ -458,12 +458,15 @@ impl SurfaceState {
             .sum()
     }
 
-    fn content_wants_redraw(&self) -> bool {
-        !self.content.is_empty()
-            && self.frame.content.iter().any(|id| {
-                self.content
+    fn content_wants_redraw(
+        &self,
+        producers: &FxHashMap<ProducerId, gpu_content::Producer>,
+    ) -> bool {
+        !self.bindings.is_empty()
+            && self.frame.content.iter().any(|(id, _)| {
+                producers
                     .get(id)
-                    .is_some_and(gpu_content::Slot::wants_redraw)
+                    .is_some_and(gpu_content::Producer::wants_redraw)
             })
     }
 
@@ -513,17 +516,6 @@ impl SurfaceState {
                 .values()
                 .filter_map(|entry| entry.capture.as_ref())
                 .map(planes::static_layer::Capture::bytes)
-                .sum::<u64>()
-            + self
-                .content
-                .values()
-                .filter_map(|slot| slot.image.as_ref())
-                .map(|image| u64::from(image.width) * u64::from(image.height) * 8)
-                .sum::<u64>()
-            + self
-                .external
-                .values()
-                .map(|_| external::Slot::GPU_BYTES)
                 .sum::<u64>()
             + self.backdrop_bytes()
     }
@@ -742,6 +734,14 @@ pub struct GpuRenderer {
     #[cfg(all(unix, not(target_vendor = "apple")))]
     submit_lock: std::sync::Arc<std::sync::Mutex<()>>,
     surfaces: FxHashMap<SurfaceId, SurfaceState>,
+    /// Every live [`GpuProducer`](cherenkov::GpuProducer) by its
+    /// `ProducerId`: renderer-scoped, shared by bindings on any surface.
+    producers: FxHashMap<ProducerId, gpu_content::Producer>,
+    /// Retired before its registration reached the stream: a handle
+    /// created and dropped while the add was still queued sends its
+    /// retirement through the producer's own queue, which can beat the
+    /// add to this thread. The add skips a `ProducerId` found here.
+    pending_retire: FxHashSet<ProducerId>,
     fonts: FxHashMap<u64, FontData>,
     /// Registered images.
     images: FxHashMap<u64, GpuImage>,
@@ -812,6 +812,10 @@ struct GlyphResources<'a> {
     fonts: &'a FxHashMap<u64, FontData>,
     images: &'a FxHashMap<u64, GpuImage>,
     bitmaps: &'a FxHashMap<BitmapKey, GpuBitmap>,
+    /// The producers' current frames by id — every binding samples the
+    /// one its producer holds. The producers themselves stay on the
+    /// render thread: a rendered producer's content is `!Sync`.
+    producers: &'a FxHashMap<ProducerId, &'a external::Slot>,
 }
 
 /// Atlas origins produced by one deferred raster.
@@ -1305,7 +1309,6 @@ fn image_view<'a>(
     images: &'a FxHashMap<u64, GpuImage>,
     bitmaps: &'a FxHashMap<BitmapKey, GpuBitmap>,
     shaders: &'a FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
-    content: &'a FxHashMap<LayerId, gpu_content::Slot>,
 ) -> &'a wgpu::TextureView {
     match source {
         lower::ImageSource::Registered(id) => {
@@ -1316,15 +1319,8 @@ fn image_view<'a>(
         }
         lower::ImageSource::Bitmap(key) => &bitmaps.get(key).expect("prepared bitmap").image.view,
         lower::ImageSource::Shader(key) => &shaders[key].image.view,
-        lower::ImageSource::Content(layer) => {
-            &content[layer]
-                .image
-                .as_ref()
-                .expect("rendered content")
-                .view
-        }
-        lower::ImageSource::External(_) => {
-            unreachable!("external ranges bind the external pipeline")
+        lower::ImageSource::Content(_) => {
+            unreachable!("producer ranges bind the external pipeline")
         }
     }
 }
@@ -2097,6 +2093,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             pending_origins: Vec::new(),
             commit_touches: Vec::new(),
             surfaces: FxHashMap::default(),
+            producers: FxHashMap::default(),
+            pending_retire: FxHashSet::default(),
             fonts: FxHashMap::default(),
             images: FxHashMap::default(),
             bitmaps: FxHashMap::default(),
@@ -2401,6 +2399,8 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         pending_origins: Vec::new(),
         commit_touches: Vec::new(),
         surfaces: FxHashMap::default(),
+        producers: FxHashMap::default(),
+        pending_retire: FxHashSet::default(),
         fonts: FxHashMap::default(),
         images: FxHashMap::default(),
         bitmaps: FxHashMap::default(),
@@ -2445,8 +2445,9 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
 /// The stack entries the surface's committed plan promotes, each with its
 /// installed frame and install generation — optionally only `updates`'s
 /// layers.
-fn plane_stack<'a>(
+fn plane_stack<'a, 'p: 'a>(
     surface: &'a SurfaceState,
+    producers: &'a FxHashMap<ProducerId, &'p external::Slot>,
     updates: Option<&'a FxHashSet<LayerId>>,
 ) -> impl Iterator<Item = planes::Plane<'a>> + 'a {
     surface
@@ -2455,40 +2456,53 @@ fn plane_stack<'a>(
         .iter()
         .filter(move |placement| updates.is_none_or(|updates| updates.contains(&placement.layer)))
         .map(|placement| {
-            let content = surface.external.get(&placement.layer).map_or_else(
-                || {
-                    let capture = surface.static_layers[&placement.layer]
-                        .capture
-                        .as_ref()
-                        .expect("promoted pixels are captured");
-                    planes::PlaneContent::Raster {
-                        view: capture.source.as_ref().map(|(_, view)| view),
-                        generation: capture.generation,
-                    }
-                },
-                |slot| planes::PlaneContent::Frame {
-                    frame: &slot.frame,
-                    generation: slot.generation,
-                },
-            );
+            let content = surface
+                .bindings
+                .get(&placement.layer)
+                .and_then(|binding| producers.get(&binding.producer()).copied())
+                .map_or_else(
+                    || {
+                        let capture = surface.static_layers[&placement.layer]
+                            .capture
+                            .as_ref()
+                            .expect("promoted pixels are captured");
+                        planes::PlaneContent::Raster {
+                            view: capture.source.as_ref().map(|(_, view)| view),
+                            generation: capture.generation,
+                        }
+                    },
+                    |slot| planes::PlaneContent::Frame {
+                        frame: &slot.frame,
+                        generation: slot.generation,
+                    },
+                );
             planes::Plane { placement, content }
         })
 }
 
-/// `surf`'s promotion candidates — the external-frame layers whose
-/// installed frame a plane can show, each with its content size — filled
+/// `surf`'s promotion candidates — the producer bindings whose current
+/// frame a plane can show, each at its binding's output size — filled
 /// into `candidates`, which keeps its allocation between fills (#90).
 fn plane_candidates<'a>(
     surf: &SurfaceState,
+    producers: &FxHashMap<ProducerId, &external::Slot>,
     candidates: &'a mut FxHashMap<LayerId, planes::Candidate>,
 ) -> &'a FxHashMap<LayerId, planes::Candidate> {
     candidates.clear();
-    candidates.extend(
-        surf.external
-            .iter()
-            .filter(|(_, slot)| slot.on_plane)
-            .map(|(layer, slot)| (*layer, slot.size.into())),
-    );
+    candidates.extend(surf.bindings.iter().filter_map(|(layer, binding)| {
+        let slot = producers.get(&binding.producer()).copied()?;
+        slot.on_plane.then_some((
+            *layer,
+            planes::Candidate {
+                size: slot.size,
+                raster: kurbo::Affine::scale_non_uniform(
+                    f64::from(binding.size.0) / f64::from(slot.size.0),
+                    f64::from(binding.size.1) / f64::from(slot.size.1),
+                ),
+                source: planes::Source::Frame,
+            },
+        ))
+    }));
     candidates.extend(surf.static_layers.iter().filter_map(|(&layer, entry)| {
         let domain = entry.domain?;
         (entry.quiet_frames >= entry.quiet_required).then_some((
@@ -2505,15 +2519,15 @@ fn plane_candidates<'a>(
 
 fn plane_frames<'a>(
     surf: &SurfaceState,
+    producers: &FxHashMap<ProducerId, &external::Slot>,
     frames: &'a mut FxHashMap<LayerId, (ExternalFrame, u64)>,
 ) -> &'a FxHashMap<LayerId, (ExternalFrame, u64)> {
     frames.clear();
-    frames.extend(
-        surf.external
-            .iter()
-            .filter(|(_, slot)| slot.on_plane)
-            .map(|(layer, slot)| (*layer, (slot.frame.clone(), slot.generation))),
-    );
+    frames.extend(surf.bindings.iter().filter_map(|(layer, binding)| {
+        let slot = producers.get(&binding.producer()).copied()?;
+        slot.on_plane
+            .then_some((*layer, (slot.frame.clone(), slot.generation)))
+    }));
     frames
 }
 
@@ -2591,7 +2605,6 @@ impl Renderer for GpuRenderer {
                 static_walk: Vec::new(),
                 plan_dirty: false,
                 parts: Vec::new(),
-                frames_installed: 0,
                 textures,
                 refresh,
                 present_pending: false,
@@ -2605,8 +2618,7 @@ impl Renderer for GpuRenderer {
                 backdrop: [None, None],
                 backdrop_groups: FxHashMap::default(),
                 layers: FxHashMap::default(),
-                content: FxHashMap::default(),
-                external: FxHashMap::default(),
+                bindings: FxHashMap::default(),
                 shader_textures: FxHashMap::default(),
                 frame: LoweredFrame::default(),
                 #[cfg(target_vendor = "apple")]
@@ -2798,9 +2810,14 @@ impl Renderer for GpuRenderer {
             }
         }
         diag::set_surface(None);
+        // The surface's bindings die on the render thread: a drop that
+        // held its producer's last reference posts the retirement onto
+        // the producer's own queue, never the channel this thread
+        // consumes.
         self.surfaces.remove(&id);
         self.planes.remove(&id);
         self.update_filter_activity();
+        self.update_producer_gates();
     }
 
     /// Validates font data and detects native colour-glyph formats.
@@ -2848,12 +2865,13 @@ impl Renderer for GpuRenderer {
     ) -> Option<cherenkov::Picture> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface)?;
-        if state.content.remove(&layer).is_some() {
-            diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
-            state.binds1.clear();
-            state.painter_replays.clear();
-        }
-        state.external.remove(&layer);
+        Self::unbind_producer(
+            state,
+            &self.device,
+            self.images_gen,
+            self.atlas.mask_texture_generation(),
+            layer,
+        );
         match content {
             Some(ContentOp::Replace(list)) => {
                 if let Some(content) = state.layers.get_mut(&layer) {
@@ -2884,18 +2902,15 @@ impl Renderer for GpuRenderer {
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
             state.static_layers.remove(&layer);
-            state.external.remove(&layer);
             state.projective.remove(&layer);
             state.composed.retain(|key| key.layer != layer);
-            if state.content.remove(&layer).is_some() {
-                diag::bind_groups_dropped(
-                    &self.device,
-                    state.binds1.len() as u64,
-                    "content change",
-                );
-                state.binds1.clear();
-                state.painter_replays.clear();
-            }
+            Self::unbind_producer(
+                state,
+                &self.device,
+                self.images_gen,
+                self.atlas.mask_texture_generation(),
+                layer,
+            );
         }
     }
 
@@ -3242,6 +3257,11 @@ impl Renderer for GpuRenderer {
                 .surfaces
                 .values()
                 .map(SurfaceState::gpu_bytes)
+                .sum::<u64>()
+            + self
+                .producers
+                .values()
+                .map(gpu_content::Producer::gpu_bytes)
                 .sum::<u64>()
             + self
                 .images
@@ -3776,6 +3796,11 @@ impl GpuRenderer {
         self.frame_pass_count = 0;
         self.frame_submission = None;
         self.pass_meta.clear();
+        // Produce, then plan, then lower and encode: a rendered
+        // producer's new ring frame must be its current frame before
+        // `ready_planes`/`lower_content` build this frame's plane
+        // candidates, and one render serves every dirty surface.
+        self.render_producers(&dirty, frame.time.0).await?;
         // Lower every dirty surface first: the GPU timestamp bracket must
         // start after CPU lowering (rasters, uploads) so it measures GPU
         // work only. Instances, stops and globals are appended frame-wide
@@ -3829,12 +3854,12 @@ impl GpuRenderer {
         );
         if result.is_ok() {
             self.update_filter_activity();
+            self.update_producer_gates();
             for sf in &dirty {
                 self.render_shaders(
                     sf.id,
                     frame.time.0.saturating_duration_since(origin).as_secs_f32(),
                 )?;
-                self.render_producers(sf, frame.time.0).await?;
                 self.prepare_filters(sf.id).await?;
             }
             diag::set_phase("encode");
@@ -3923,6 +3948,11 @@ impl GpuRenderer {
         self.frame_pass_count = 0;
         self.frame_submission = None;
         self.pass_meta.clear();
+        // Produce, then plan, then lower and encode: a rendered
+        // producer's new ring frame must be its current frame before
+        // `ready_planes`/`lower_content` build this frame's plane
+        // candidates, and one render serves every dirty surface.
+        self.render_producers(&dirty, frame.time.0)?;
         // Lower every dirty surface first: the GPU timestamp bracket must
         // start after CPU lowering (rasters, uploads) so it measures GPU
         // work only. Instances, stops and globals are appended frame-wide
@@ -3974,12 +4004,12 @@ impl GpuRenderer {
         );
         if result.is_ok() {
             self.update_filter_activity();
+            self.update_producer_gates();
             for sf in &dirty {
                 self.render_shaders(
                     sf.id,
                     frame.time.0.saturating_duration_since(origin).as_secs_f32(),
                 )?;
-                self.render_producers(sf, frame.time.0)?;
             }
             diag::set_phase("encode");
             let t = Instant::now();
@@ -4023,6 +4053,28 @@ impl GpuRenderer {
         );
         self.last_frame = Some(frame.time.0);
         timing
+    }
+
+    /// Drives each producer's redraw wake gate from the surfaces whose
+    /// frames drew it: a request wakes the host while a binding is
+    /// drawn on a surface announced visible — the same
+    /// frame-membership model [`Self::update_filter_activity`] applies
+    /// to filters, so a binding whose layer was detached (and may
+    /// return) closes the gate until it is drawn again.
+    fn update_producer_gates(&mut self) {
+        let mut uses: FxHashMap<ProducerId, Vec<cherenkov::SurfaceVisibility>> =
+            FxHashMap::default();
+        for surface in self.surfaces.values() {
+            for (id, _) in &surface.frame.content {
+                let surfaces = uses.entry(*id).or_default();
+                if surfaces.last() != Some(&surface.announced) {
+                    surfaces.push(surface.announced.clone());
+                }
+            }
+        }
+        for (id, producer) in &mut self.producers {
+            producer.set_gate(uses.get(id).map_or(&[][..], Vec::as_slice));
+        }
     }
 
     fn update_filter_activity(&self) {
@@ -4312,66 +4364,89 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Renders every producer a drawn binding asked for this frame,
+    /// before planning reads its current frame: the wanted set is each
+    /// surface's bindings on the layers the frame's tree draws — a
+    /// producer whose bound layers are all outside the tree renders
+    /// nothing — folded into one output attachment at the componentwise
+    /// largest requested size and scale, rendered at most once per
+    /// engine frame.
     #[cfg(not(target_arch = "wasm32"))]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "validated display scale fits f32"
+    )]
     fn render_producers(
         &mut self,
-        sf: &SurfaceFrame<'_>,
+        dirty: &[&SurfaceFrame<'_>],
         time: Instant,
     ) -> Result<(), RenderError> {
-        let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
-        for (id, slot) in &mut surface.content {
-            slot.set_active(surface.frame.content.contains(id));
+        let mut wanted: FxHashMap<ProducerId, ((u32, u32), f32)> = FxHashMap::default();
+        for sf in dirty {
+            let surface = self.surfaces.get(&sf.id).expect("registered surface");
+            if surface.bindings.is_empty() {
+                continue;
+            }
+            for (layer, _) in sf.tree.layers() {
+                let Some(binding) = surface.bindings.get(&layer) else {
+                    continue;
+                };
+                let (wanted_size, wanted_scale) = wanted
+                    .entry(binding.producer())
+                    .or_insert((binding.size, sf.display.scale as f32));
+                wanted_size.0 = wanted_size.0.max(binding.size.0);
+                wanted_size.1 = wanted_size.1.max(binding.size.1);
+                *wanted_scale = wanted_scale.max(sf.display.scale as f32);
+            }
         }
-        for id in &surface.frame.content {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "validated display scale fits f32"
-            )]
-            surface
-                .content
-                .get_mut(id)
-                .expect("composed GPU content")
-                .render(
-                    &self.adapter,
-                    &self.device,
-                    &self.queue,
-                    time,
-                    sf.display.scale as f32,
-                )?;
+        for (id, (size, scale)) in wanted {
+            self.producers
+                .get_mut(&id)
+                .expect("composed GPU producer")
+                .render(&self.adapter, &self.device, &self.queue, time, size, scale)?;
         }
         Ok(())
     }
 
+    /// [`render_producers`](Self::render_producers), on the browser
+    /// executor.
     #[cfg(target_arch = "wasm32")]
     #[expect(
         clippy::future_not_send,
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "validated display scale fits f32"
+    )]
     async fn render_producers(
         &mut self,
-        sf: &SurfaceFrame<'_>,
+        dirty: &[&SurfaceFrame<'_>],
         time: Instant,
     ) -> Result<(), RenderError> {
-        let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
-        for (id, slot) in &mut surface.content {
-            slot.set_active(surface.frame.content.contains(id));
+        let mut wanted: FxHashMap<ProducerId, ((u32, u32), f32)> = FxHashMap::default();
+        for sf in dirty {
+            let surface = self.surfaces.get(&sf.id).expect("registered surface");
+            if surface.bindings.is_empty() {
+                continue;
+            }
+            for (layer, _) in sf.tree.layers() {
+                let Some(binding) = surface.bindings.get(&layer) else {
+                    continue;
+                };
+                let (wanted_size, wanted_scale) = wanted
+                    .entry(binding.producer())
+                    .or_insert((binding.size, sf.display.scale as f32));
+                wanted_size.0 = wanted_size.0.max(binding.size.0);
+                wanted_size.1 = wanted_size.1.max(binding.size.1);
+                *wanted_scale = wanted_scale.max(sf.display.scale as f32);
+            }
         }
-        for id in &surface.frame.content {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "validated display scale fits f32"
-            )]
-            surface
-                .content
-                .get_mut(id)
-                .expect("composed GPU content")
-                .render(
-                    &self.adapter,
-                    &self.device,
-                    &self.queue,
-                    time,
-                    sf.display.scale as f32,
-                )
+        for (id, (size, scale)) in wanted {
+            self.producers
+                .get_mut(&id)
+                .expect("composed GPU producer")
+                .render(&self.adapter, &self.device, &self.queue, time, size, scale)
                 .await?;
         }
         Ok(())
@@ -4392,7 +4467,7 @@ impl GpuRenderer {
                 .filters
                 .iter()
                 .any(|(_, id)| self.filters.wants_redraw(*id))
-                || surface.content_wants_redraw()
+                || surface.content_wants_redraw(&self.producers)
                 || surface
                     .shader_textures
                     .keys()
@@ -4462,81 +4537,189 @@ impl GpuRenderer {
         Ok(Some(surface))
     }
 
-    pub fn set_gpu_content(
+    /// Registers a rendered producer's content; the first drawn binding
+    /// runs its `setup` (`cherenkov::GpuContent`). A handle created and
+    /// dropped while this add was still queued already retired the
+    /// producer: its retirement can beat the add on the producer's own
+    /// queue, so a `pending_retire` id lands already retired.
+    pub fn add_gpu_producer(&mut self, id: ProducerId, content: crate::interop::GpuContentBox) {
+        if self.pending_retire.remove(&id) {
+            return;
+        }
+        self.producers
+            .insert(id, gpu_content::Producer::rendered(content));
+    }
+
+    /// Registers a submitted-frame producer's wake state — `dirty`
+    /// flags a landed frame, `gate` gates its host wake on a visible
+    /// binding (`cherenkov::GpuContent`). A frame producer has no setup:
+    /// the first [`Self::submit_frame`] supplies its frame.
+    pub fn add_frame_producer(
+        &mut self,
+        id: ProducerId,
+        dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        gate: std::sync::Arc<cherenkov::WakeGate>,
+    ) {
+        if self.pending_retire.remove(&id) {
+            return;
+        }
+        self.producers
+            .insert(id, gpu_content::Producer::submitted(dirty, gate));
+    }
+
+    /// Retires a producer: its last handle dropped, so no binding of it
+    /// remains — only its device resources are still registered. A
+    /// retirement that beat its producer's registration to this thread
+    /// is remembered: the add lands already retired.
+    pub fn retire_gpu_producer(&mut self, id: ProducerId) {
+        if self.producers.remove(&id).is_none() {
+            self.pending_retire.insert(id);
+        }
+    }
+
+    /// Binds a layer on `surface` to `producer` at the size the layer
+    /// needs (`cherenkov::GpuContent`). A layer has one content kind at a
+    /// time; a size change is a new binding. Returns the current frame's
+    /// declared alpha for the layer's alpha contract — `None` before the
+    /// producer's first frame.
+    pub fn bind_gpu_producer(
         &mut self,
         surface: SurfaceId,
         layer: LayerId,
+        producer: &cherenkov::GpuProducer<crate::Gpu>,
         size: (u32, u32),
-        content: crate::interop::GpuContentBox,
-    ) {
+    ) -> Option<bool> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
-        state.external.remove(&layer);
-        state.interop += 1;
-        state.content.insert(
+        Self::unbind_producer(
+            state,
+            &self.device,
+            self.images_gen,
+            self.atlas.mask_texture_generation(),
             layer,
-            gpu_content::Slot::new(content, size, state.announced.clone()),
         );
-        diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
-        state.binds1.clear();
-        state.painter_replays.clear();
+        state
+            .bindings
+            .insert(layer, gpu_content::Binding::new(producer.clone(), size));
+        state.interop += 1;
+        let producer = self.producers.get(&producer.id());
+        assert!(producer.is_some(), "GPU producer registered");
+        producer
+            .and_then(gpu_content::Producer::current)
+            .map(|slot| slot.frame.alpha() == crate::interop::RgbAlpha::Opaque)
     }
 
-    /// Installs a retained external frame on `layer` (`cherenkov::ExternalFrames`).
-    ///
-    /// The planes are sampled where the frame lands; nothing is copied or
-    /// rasterized. Any recorded or GPU content on `layer` is dropped — a
-    /// layer has one content kind at a time.
-    pub fn set_external_frame(
-        &mut self,
-        surface: SurfaceId,
+    /// Releases `layer`'s binding, if any: the bind groups sampling the
+    /// producer's current frame retire. A drop that held the producer's
+    /// last reference posts its retirement onto the producer's own
+    /// queue — it never blocks this thread on the channel it drains.
+    fn unbind_producer(
+        state: &mut SurfaceState,
+        device: &wgpu::Device,
+        images_gen: u64,
+        mask_gen: u64,
         layer: LayerId,
-        frame: crate::interop::ExternalFrame,
     ) {
+        let Some(binding) = state.bindings.remove(&layer) else {
+            return;
+        };
+        let id = binding.producer();
+        state.interop += 1;
+        // #169 A4: only bind groups referencing this producer's
+        // attachment went stale — drop them, keep the rest.
+        retire_binds1(
+            state,
+            device,
+            images_gen,
+            mask_gen,
+            "producer unbound",
+            |key| key.2 == Some(lower::ImageSource::Content(id)),
+        );
+    }
+
+    /// Detaches every live producer and drops its device resources —
+    /// the device-replacement contract: a rendered producer's content
+    /// comes back for the next renderer to register again (its first
+    /// drawn binding runs `setup` on the new device); a frame
+    /// producer's frame dropped with the device — its sink's next
+    /// submit supplies one.
+    pub fn drain_gpu_producers(
+        &mut self,
+    ) -> Vec<(ProducerId, cherenkov::DrainedProducer<crate::Gpu>)> {
+        for surface in self.surfaces.values_mut() {
+            if !surface.bindings.is_empty() {
+                surface.interop += 1;
+                surface.bindings.clear();
+            }
+        }
+        self.producers
+            .drain()
+            .map(|(id, producer)| {
+                (
+                    id,
+                    producer.into_content().map_or_else(
+                        || cherenkov::DrainedProducer::Frame,
+                        cherenkov::DrainedProducer::Rendered,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Installs a submitted frame as `producer`'s current frame
+    /// (`cherenkov::GpuContent`): every binding of the producer shows it,
+    /// sampled where the frame lands — never copied or rasterized — and
+    /// the layers bound on any surface come back for the surface's plane
+    /// bookkeeping.
+    pub fn submit_frame(
+        &mut self,
+        id: ProducerId,
+        frame: crate::interop::ExternalFrame,
+    ) -> Vec<(SurfaceId, LayerId)> {
         // Registration prepares the external-frame family — the layout
         // and pipelines, and for a native frame the Vulkan context — so
         // a cold frame's encode does not pay their creation (#170, #165).
         #[cfg(all(unix, not(target_vendor = "apple")))]
         let needs_native = matches!(&frame.planes, crate::interop::FramePlanes::Native(_));
-        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
-        state.layers.remove(&layer);
-        state.content.remove(&layer);
-        state.interop += 1;
-        state.frames_installed += 1;
-        let on_plane = state.promotes && <planes::Platform as planes::Compositor>::shows(&frame);
-        #[cfg(target_os = "android")]
-        if state.promotes {
-            let reason = if on_plane {
-                None
-            } else {
-                Some(match &frame.planes {
-                    crate::interop::FramePlanes::Native(native) => {
-                        surface_control::planes::ineligible(native)
-                            .unwrap_or(surface_control::planes::Ineligible::NotABuffer)
-                    }
-                    _ => surface_control::planes::Ineligible::NotABuffer,
-                })
-            };
-            tracing::debug!(target: "cherenkov::planes", layer = ?layer, reason = ?reason, "external frame eligibility");
+        let mut bound = Vec::new();
+        for (sid, state) in &mut self.surfaces {
+            let mut draws = false;
+            for (layer, binding) in &state.bindings {
+                if binding.producer() == id {
+                    bound.push((*sid, *layer));
+                    draws = true;
+                }
+            }
+            if draws {
+                // A new frame on a bound layer is the layer's own frame
+                // swap: retained binds of the producer's slot re-lower,
+                // and the layer's plane hands the system a new buffer.
+                state.interop += 1;
+                #[cfg(target_os = "android")]
+                if state.promotes && !<planes::Platform as planes::Compositor>::shows(&frame) {
+                    let reason = match &frame.planes {
+                        crate::interop::FramePlanes::Native(native) => {
+                            surface_control::planes::ineligible(native)
+                                .unwrap_or(surface_control::planes::Ineligible::NotABuffer)
+                        }
+                        _ => surface_control::planes::Ineligible::NotABuffer,
+                    };
+                    tracing::debug!(target: "cherenkov::planes", producer = ?id, reason = ?reason, "frame producer eligibility");
+                }
+            }
         }
-        state.external.insert(
-            layer,
-            external::Slot::new(
-                &self.device,
-                &self.queue,
-                frame,
-                state.frames_installed,
-                on_plane,
-            ),
-        );
+        if let Some(producer) = self.producers.get_mut(&id) {
+            producer.submit(&self.device, &self.queue, frame);
+        }
         if let Err(error) = self.ensure_external() {
-            tracing::warn!(%error, "external-frame preparation failed at registration");
+            tracing::warn!(%error, "external-frame preparation failed at submission");
         }
         #[cfg(all(unix, not(target_vendor = "apple")))]
         if needs_native {
             self.ensure_native();
         }
+        bound
     }
 
     /// Builds the Vulkan native external-frame context on first need — a
@@ -4561,29 +4744,6 @@ impl GpuRenderer {
                 self.native_error = Some(error.to_string());
             }
         }
-    }
-
-    pub fn resize_gpu_content(&mut self, surface: SurfaceId, layer: LayerId, size: (u32, u32)) {
-        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
-        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
-        state.interop += 1;
-        state
-            .content
-            .get_mut(&layer)
-            .expect("layer has GPU content")
-            .resize(size);
-        // #169 A4: only entries referencing this layer's content image
-        // went stale — drop them, keep the rest.
-        let images_gen = self.images_gen;
-        let mask_gen = self.atlas.mask_texture_generation();
-        retire_binds1(
-            state,
-            &self.device,
-            images_gen,
-            mask_gen,
-            "content resize",
-            |key| key.2 == Some(lower::ImageSource::Content(layer)),
-        );
     }
 
     /// Builds the external-frame group-1 layout and both format pipelines
@@ -4719,7 +4879,7 @@ impl GpuRenderer {
             },
             replacements,
             interop: surf.interop,
-            stale: surf.stale_projective(&self.filters, &self.shaders),
+            stale: surf.stale_projective(&self.filters, &self.shaders, &self.producers),
         }
     }
 
@@ -4877,9 +5037,14 @@ impl GpuRenderer {
     }
 
     fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
-        let Some(presenter) = &mut self.presenter else {
+        if self.presenter.is_none() {
             return Ok(Redraw::None);
-        };
+        }
+        let currents: FxHashMap<ProducerId, &external::Slot> = self
+            .producers
+            .iter()
+            .filter_map(|(id, producer)| producer.current().map(|slot| (*id, slot)))
+            .collect();
         let mut redraw = None::<cherenkov::RefreshRange>;
         for sf in frame.surfaces {
             let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
@@ -4898,71 +5063,27 @@ impl GpuRenderer {
             let renegotiate =
                 sf.display_moved || sf.display.scale.to_bits() != surface.display.scale.to_bits();
             surface.display = sf.display;
-            if renegotiate && let Some(window) = &mut surface.window {
-                window
-                    .reselect(&self.adapter, &self.device)
-                    .map_err(|error| RenderError::Render(error.to_string()))?;
-                surface.present_pending = true;
-            }
-            if renegotiate && let Some(system) = self.planes.get_mut(&sf.id) {
-                planes::SystemPlanes::reselect(system, &self.adapter, &self.device)
-                    .map_err(|error| RenderError::Render(error.to_string()))?;
-                surface.present_pending = true;
+            if renegotiate {
+                Self::reselect_surface(
+                    self.planes.get_mut(&sf.id),
+                    &self.adapter,
+                    &self.device,
+                    surface,
+                )?;
             }
             if surface.present_pending {
-                let presentation = match self.planes.get_mut(&sf.id) {
-                    Some(system) => {
-                        // The frame's own `plane_frames` carries the
-                        // update set — admitted by this render's
-                        // `plane_only`, so it cannot be a stale frame's.
-                        if self.plane_only.contains(&sf.id) {
-                            // The frame's only change is new frames on
-                            // these promoted layers: present them
-                            // alone, leaving every part's shown buffer
-                            // in place (#90).
-                            planes::SystemPlanes::refresh(
-                                system,
-                                plane_stack(surface, sf.plane_frames),
-                            )?;
-                            planes::Presentation::Presented
-                        } else {
-                            let parts: Vec<_> = (0..surface.plan.parts())
-                                .map(|n| planes::Part {
-                                    view: match n {
-                                        0 => &surface.view,
-                                        n => &surface.parts[n - 1].1,
-                                    },
-                                })
-                                .collect();
-                            let stack: Vec<_> = plane_stack(surface, None).collect();
-                            planes::SystemPlanes::compose(
-                                system,
-                                planes::Composition {
-                                    device: &self.device,
-                                    queue: &self.queue,
-                                    presenter,
-                                    size: surface.size,
-                                    display: sf.display,
-                                    parts: &parts,
-                                    planes: &stack,
-                                },
-                            )?
-                        }
-                    }
-                    None => {
-                        if presenter.present(
-                            &self.device,
-                            &self.queue,
-                            surface.window.as_ref().expect("pending window"),
-                            &surface.view,
-                            sf.display.headroom,
-                        )? {
-                            planes::Presentation::Presented
-                        } else {
-                            planes::Presentation::Retry
-                        }
-                    }
-                };
+                let presentation = Self::present_surface(
+                    self.planes.get_mut(&sf.id),
+                    self.plane_only.contains(&sf.id),
+                    (
+                        &self.device,
+                        &self.queue,
+                        self.presenter.as_mut().expect("checked above"),
+                    ),
+                    surface,
+                    sf,
+                    &currents,
+                )?;
                 surface.present_pending = presentation != planes::Presentation::Presented;
                 if presentation == planes::Presentation::Presented {
                     for capture in surface
@@ -4997,6 +5118,97 @@ impl GpuRenderer {
         Ok(redraw.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
     }
 
+    /// A display move or a scale change re-runs the window's output
+    /// negotiation — the window's and the plane system's — which
+    /// reconfigures only when the selected pair moves, and asks for a
+    /// present either way.
+    fn reselect_surface(
+        system: Option<&mut planes::Platform>,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        surface: &mut SurfaceState,
+    ) -> Result<(), RenderError> {
+        if let Some(window) = &mut surface.window {
+            window
+                .reselect(adapter, device)
+                .map_err(|error| RenderError::Render(error.to_string()))?;
+            surface.present_pending = true;
+        }
+        if let Some(system) = system {
+            planes::SystemPlanes::reselect(system, adapter, device)
+                .map_err(|error| RenderError::Render(error.to_string()))?;
+            surface.present_pending = true;
+        }
+        Ok(())
+    }
+
+    /// Presents `sf`'s surface: through its plane system when it has one —
+    /// the frame-swap refresh when this render admitted frames only, a
+    /// full compose otherwise — and through the window presenter when it
+    /// has none.
+    fn present_surface(
+        system: Option<&mut planes::Platform>,
+        frames_only: bool,
+        present: (&wgpu::Device, &wgpu::Queue, &mut present::Presenter),
+        surface: &SurfaceState,
+        sf: &SurfaceFrame<'_>,
+        currents: &FxHashMap<ProducerId, &external::Slot>,
+    ) -> Result<planes::Presentation, RenderError> {
+        let (device, queue, presenter) = present;
+        match system {
+            Some(system) => {
+                // The frame's own `plane_frames` carries the update set —
+                // admitted by this render's `plane_only`, so it cannot be
+                // a stale frame's.
+                if frames_only {
+                    // The frame's only change is new frames on these
+                    // promoted layers: present them alone, leaving every
+                    // part's shown buffer in place (#90).
+                    planes::SystemPlanes::refresh(
+                        system,
+                        plane_stack(surface, currents, sf.plane_frames),
+                    )?;
+                    Ok(planes::Presentation::Presented)
+                } else {
+                    let parts: Vec<_> = (0..surface.plan.parts())
+                        .map(|n| planes::Part {
+                            view: match n {
+                                0 => &surface.view,
+                                n => &surface.parts[n - 1].1,
+                            },
+                        })
+                        .collect();
+                    let stack: Vec<_> = plane_stack(surface, currents, None).collect();
+                    planes::SystemPlanes::compose(
+                        system,
+                        planes::Composition {
+                            device,
+                            queue,
+                            presenter,
+                            size: surface.size,
+                            display: sf.display,
+                            parts: &parts,
+                            planes: &stack,
+                        },
+                    )
+                }
+            }
+            None => Ok(
+                if presenter.present(
+                    device,
+                    queue,
+                    surface.window.as_ref().expect("pending window"),
+                    &surface.view,
+                    sf.display.headroom,
+                )? {
+                    planes::Presentation::Presented
+                } else {
+                    planes::Presentation::Retry
+                },
+            ),
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn lower_all(
         &mut self,
@@ -5011,6 +5223,16 @@ impl GpuRenderer {
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
             self.ready_planes(frames, pending);
+            // The workers share the producers' current frames, not the
+            // producers: a rendered producer's content is render-thread
+            // state (`!Sync`), and a frame slot is all the lowering
+            // reads anyway.
+            let currents: FxHashMap<ProducerId, &external::Slot> = self
+                .producers
+                .iter()
+                .filter_map(|(id, producer)| producer.current().map(|slot| (*id, slot)))
+                .collect();
+            let producers = &currents;
             let mut results: Vec<Result<Lowered, RenderError>> = if pending.len() > 1 {
                 let (atlas, images, bitmaps) = (&self.atlas, &self.images, &self.bitmaps);
                 // `FontData`'s COLR cache is a `RefCell` — !Sync — so
@@ -5040,6 +5262,7 @@ impl GpuRenderer {
                                         fonts: &fonts,
                                         images,
                                         bitmaps,
+                                        producers,
                                     },
                                     groups,
                                     inputs,
@@ -5066,6 +5289,7 @@ impl GpuRenderer {
                                 fonts: &self.fonts,
                                 images: &self.images,
                                 bitmaps: &self.bitmaps,
+                                producers,
                             },
                             groups,
                             inputs,
@@ -5117,6 +5341,12 @@ impl GpuRenderer {
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
             self.ready_planes(frames, pending);
+            let currents: FxHashMap<ProducerId, &external::Slot> = self
+                .producers
+                .iter()
+                .filter_map(|(id, producer)| producer.current().map(|slot| (*id, slot)))
+                .collect();
+            let producers = &currents;
             let mut results: Vec<Result<Lowered, RenderError>> = pending
                 .iter_mut()
                 .zip(frames)
@@ -5130,6 +5360,7 @@ impl GpuRenderer {
                             fonts: &self.fonts,
                             images: &self.images,
                             bitmaps: &self.bitmaps,
+                            producers,
                         },
                         groups,
                         inputs,
@@ -5177,8 +5408,8 @@ impl GpuRenderer {
             .filters
             .iter()
             .any(|(_, id)| self.filters.wants_redraw(*id))
-            || surface.content_wants_redraw()
-            || surface.projective_wants_redraw(&self.filters, &self.shaders)
+            || surface.content_wants_redraw(&self.producers)
+            || surface.projective_wants_redraw(&self.filters, &self.shaders, &self.producers)
             || surface
                 .shader_textures
                 .keys()
@@ -5288,8 +5519,13 @@ impl GpuRenderer {
         // The committed plan judged only the candidates the platform
         // reported ready; the check must see the same offered set — a
         // pending candidate is no plan change, a newly ready one is.
-        let candidates = plane_candidates(surface, &mut self.candidates);
-        let installed = plane_frames(surface, &mut self.candidate_frames);
+        let currents: FxHashMap<ProducerId, &external::Slot> = self
+            .producers
+            .iter()
+            .filter_map(|(id, producer)| producer.current().map(|slot| (*id, slot)))
+            .collect();
+        let candidates = plane_candidates(surface, &currents, &mut self.candidates);
+        let installed = plane_frames(surface, &currents, &mut self.candidate_frames);
         planes::SystemPlanes::prepare(system, candidates, installed, &mut self.ready);
         if let Some(frames) = sf.plane_frames {
             return planes::frames_only::<planes::Platform>(
@@ -5361,8 +5597,13 @@ impl GpuRenderer {
             let Some(system) = self.planes.get_mut(&sf.id) else {
                 continue;
             };
-            let candidates = plane_candidates(surface, &mut self.candidates);
-            let frames = plane_frames(surface, &mut self.candidate_frames);
+            let currents: FxHashMap<ProducerId, &external::Slot> = self
+                .producers
+                .iter()
+                .filter_map(|(id, producer)| producer.current().map(|slot| (*id, slot)))
+                .collect();
+            let candidates = plane_candidates(surface, &currents, &mut self.candidates);
+            let frames = plane_frames(surface, &currents, &mut self.candidate_frames);
             planes::SystemPlanes::groom_with_frames(system, candidates, frames);
             if surface.plan_dirty || planes::SystemPlanes::wants_plan(system) {
                 dirty.push(sf);
@@ -5377,18 +5618,24 @@ impl GpuRenderer {
     /// a candidate it does not report keeps compositing in-engine this
     /// frame.
     fn ready_planes(&mut self, frames: &[&SurfaceFrame<'_>], pending: &[SurfaceState]) {
+        let currents: FxHashMap<ProducerId, &external::Slot> = self
+            .producers
+            .iter()
+            .filter_map(|(id, producer)| producer.current().map(|slot| (*id, slot)))
+            .collect();
         let (ready_sets, planes, candidates, candidate_frames) = (
             &mut self.ready_sets,
             &mut self.planes,
             &mut self.candidates,
             &mut self.candidate_frames,
         );
+        let producers = &currents;
         for (i, (sf, surf)) in frames.iter().zip(pending.iter()).enumerate() {
             if ready_sets.len() == i {
                 ready_sets.push(FxHashSet::default());
             }
-            let candidates = plane_candidates(surf, candidates);
-            let frames = plane_frames(surf, candidate_frames);
+            let candidates = plane_candidates(surf, producers, candidates);
+            let frames = plane_frames(surf, producers, candidate_frames);
             if let Some(system) = planes.get_mut(&sf.id) {
                 planes::SystemPlanes::prepare(system, candidates, frames, &mut ready_sets[i]);
             } else {
@@ -5412,7 +5659,7 @@ impl GpuRenderer {
         surf.plan_dirty = false;
         let mut candidates = FxHashMap::default();
         surf.plan = if surf.promotes {
-            plane_candidates(surf, &mut candidates);
+            plane_candidates(surf, resources.producers, &mut candidates);
             planes::plan::<planes::Platform>(frame.tree, &candidates, ready)
         } else {
             planes::Plan::default()
@@ -5441,8 +5688,7 @@ impl GpuRenderer {
                 fonts: resources.fonts,
                 images: resources.images,
                 bitmaps: resources.bitmaps,
-                content: &surf.content,
-                external: &surf.external,
+                content: &surf.bindings,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
             let result = lowering.prepare(&mut layers, &glyphs).and_then(|()| {
@@ -5489,8 +5735,7 @@ impl GpuRenderer {
             result
         };
         surf.layers = layers;
-        surf.frame.content.sort_unstable_by_key(|id| id.raw());
-        surf.frame.content.dedup();
+        surf.frame.content.sort_unstable_by_key(|(id, _)| id.raw());
         surf.frame.external.sort_unstable_by_key(|id| id.raw());
         surf.frame.external.dedup();
         result.map(|()| lowered)
@@ -6683,7 +6928,7 @@ impl GpuRenderer {
                 .passes
                 .iter()
                 .flat_map(|pass| &pass.ranges)
-                .any(|range| matches!(range.image, Some(lower::ImageSource::External(_))))
+                .any(|range| matches!(range.image, Some(lower::ImageSource::Content(_))))
         });
         if needs_external {
             self.ensure_external()?;
@@ -7023,10 +7268,11 @@ impl GpuRenderer {
             #[cfg(all(unix, not(target_vendor = "apple")))]
             let native_run = self.native.is_some()
                 && pass.ranges.iter().any(|range| {
-                    matches!(&range.image, Some(lower::ImageSource::External(layer))
-                        if surf
-                            .external
-                            .get(layer)
+                    matches!(&range.image, Some(lower::ImageSource::Content(id))
+                        if self
+                            .producers
+                            .get(id)
+                            .and_then(gpu_content::Producer::current)
                             .and_then(|slot| slot.native_frame())
                             .is_some())
                 });
@@ -7076,11 +7322,13 @@ impl GpuRenderer {
                     .ranges
                     .iter()
                     .filter_map(|range| match &range.image {
-                        Some(lower::ImageSource::External(layer)) => {
-                            surf.external.get(layer).and_then(|slot| {
+                        Some(lower::ImageSource::Content(id)) => self
+                            .producers
+                            .get(id)
+                            .and_then(gpu_content::Producer::current)
+                            .and_then(|slot| {
                                 slot.vulkan_frame().map(|frame| frame.generation.clone())
-                            })
-                        }
+                            }),
                         _ => None,
                     })
                     .collect();
@@ -7371,11 +7619,12 @@ impl GpuRenderer {
                 // pass with a Load (#166). `Rgb` generations stay on the
                 // ordinary external path below.
                 #[cfg(all(unix, not(target_vendor = "apple")))]
-                if let Some(lower::ImageSource::External(layer)) = &range.image
+                if let Some(lower::ImageSource::Content(id)) = &range.image
                     && self.native.is_some()
-                    && surf
-                        .external
-                        .get(layer)
+                    && self
+                        .producers
+                        .get(id)
+                        .and_then(gpu_content::Producer::current)
                         .and_then(|slot| slot.native_frame())
                         .is_some()
                 {
@@ -7383,14 +7632,22 @@ impl GpuRenderer {
                     let mut draws = Vec::new();
                     let mut end = ri;
                     while end < pass.ranges.len() {
-                        let Some(lower::ImageSource::External(l)) = &pass.ranges[end].image else {
+                        let Some(lower::ImageSource::Content(pid)) = &pass.ranges[end].image else {
                             break;
                         };
-                        let Some(frame) = surf.external.get(l).and_then(|slot| slot.native_frame())
+                        let Some(frame) = self
+                            .producers
+                            .get(pid)
+                            .and_then(gpu_content::Producer::current)
+                            .and_then(|slot| slot.native_frame())
                         else {
                             break;
                         };
-                        let slot = surf.external.get(l).expect("slot checked");
+                        let slot = self
+                            .producers
+                            .get(pid)
+                            .and_then(gpu_content::Producer::current)
+                            .expect("slot checked");
                         draws.push(external::vulkan::OpDraw {
                             generation: frame.generation.clone(),
                             first_instance: inst_base + pass.ranges[end].instances.start,
@@ -7451,10 +7708,11 @@ impl GpuRenderer {
                     // a pass with a later native op still coming must not
                     // write it here.
                     let more_native = pass.ranges[end..].iter().any(|range| {
-                        matches!(&range.image, Some(lower::ImageSource::External(layer))
-                            if surf
-                                .external
-                                .get(layer)
+                        matches!(&range.image, Some(lower::ImageSource::Content(id))
+                            if self
+                                .producers
+                                .get(id)
+                                .and_then(gpu_content::Producer::current)
                                 .and_then(|slot| slot.native_frame())
                                 .is_some())
                     });
@@ -7506,7 +7764,18 @@ impl GpuRenderer {
                     ri = end;
                     continue;
                 }
-                if let Some(lower::ImageSource::External(layer)) = &range.image {
+                if let Some(lower::ImageSource::Content(id)) = &range.image {
+                    // The binding draws nothing while its producer has
+                    // no current frame — a submitted frame that has not
+                    // landed, or a render the full ring skipped.
+                    let Some(slot) = self
+                        .producers
+                        .get_mut(id)
+                        .and_then(gpu_content::Producer::current_mut)
+                    else {
+                        ri += 1;
+                        continue;
+                    };
                     if pipeline != Bound::External {
                         pipeline = Bound::External;
                         stats.pipeline_switches += 1;
@@ -7517,11 +7786,6 @@ impl GpuRenderer {
                     }
                     let Some(ext_layout) = &self.ext_layout else {
                         return Err(RenderError::Render("external layout unbuilt".into()));
-                    };
-                    let Some(slot) = surf.external.get_mut(layer) else {
-                        return Err(RenderError::Render(format!(
-                            "no external frame on layer {layer:?}"
-                        )));
                     };
                     let bind = slot.bind(
                         &self.device,
@@ -7605,7 +7869,6 @@ impl GpuRenderer {
                                     &self.images,
                                     &self.bitmaps,
                                     &surf.shader_textures,
-                                    &surf.content,
                                 )
                             }),
                             range.mask.map(|k| {
@@ -7700,10 +7963,11 @@ impl GpuRenderer {
         #[cfg(target_vendor = "apple")]
         {
             use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _};
-            for layer in &surf.frame.external {
-                let Some(crate::interop::FrameSync::Metal { event, value }) = surf
-                    .external
-                    .get(layer)
+            for id in &surf.frame.external {
+                let Some(crate::interop::FrameSync::Metal { event, value }) = self
+                    .producers
+                    .get(id)
+                    .and_then(gpu_content::Producer::current)
                     .and_then(|slot| slot.frame.wait.as_ref())
                 else {
                     continue;

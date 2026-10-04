@@ -320,7 +320,6 @@ pub fn encode(
                             resources.images,
                             resources.bitmaps,
                             &surf.shader_textures,
-                            &surf.content,
                         )
                     }),
                     range.mask.map(|key| {

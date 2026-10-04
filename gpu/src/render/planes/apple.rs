@@ -97,6 +97,8 @@ use crate::render::present::{OutputRequest, WindowSurface};
 
 mod animation;
 mod raster;
+/// The rendered producer's scan-out frame ring.
+pub(in crate::render) mod ring;
 
 /// Main-thread storage with asynchronous destruction. Every reference, including
 /// the last one, is released on main; `MainThreadBound::drop` can never dispatch
@@ -627,18 +629,19 @@ fn frame_surface(frame: &ExternalFrame) -> Option<Retained<IOSurfaceRef>> {
             plane: texture,
             alpha,
         } => {
-            // A display layer shows opaque video; translucent frames stay in
-            // the engine, which composites their alpha.
-            if *alpha != RgbAlpha::Opaque {
-                return None;
-            }
+            // A display layer shows opaque video; translucent video stays
+            // in the engine, which composites its alpha. A premultiplied
+            // f16 frame is the engine's own frame ring: the layer
+            // composites its alpha as it does any contents'.
+            let format = match (texture.format(), alpha) {
+                (wgpu::TextureFormat::Bgra8Unorm, RgbAlpha::Opaque) => kCVPixelFormatType_32BGRA,
+                (wgpu::TextureFormat::Rgba16Float, RgbAlpha::Opaque | RgbAlpha::Premultiplied) => {
+                    kCVPixelFormatType_64RGBAHalf
+                }
+                _ => return None,
+            };
             let (surface, 0) = plane(texture)? else {
                 return None;
-            };
-            let format = match texture.format() {
-                wgpu::TextureFormat::Bgra8Unorm => kCVPixelFormatType_32BGRA,
-                wgpu::TextureFormat::Rgba16Float => kCVPixelFormatType_64RGBAHalf,
-                _ => return None,
             };
             (surface, format)
         }
@@ -1262,14 +1265,22 @@ impl Compositor for LayerPlanes {
     }
 
     fn shows(frame: &ExternalFrame) -> bool {
-        // The proven class is opaque BGRA8/sRGB. YUV range expansion,
-        // BT.1886, and HDR tone mapping differ from the engine; they remain
-        // engine-composited until their platform parity is established.
-        matches!(&frame.planes, FramePlanes::Rgb { plane, .. }
+        // The proven external class is opaque BGRA8/sRGB. YUV range
+        // expansion, BT.1886, and HDR tone mapping differ from the engine;
+        // they remain engine-composited until their platform parity is
+        // established. The second admitted class is the engine's own frame
+        // ring — premultiplied f16 in the working space: its declared
+        // decode is the identity, so the layer shows exactly the pixels
+        // the engine composited.
+        let video = matches!(&frame.planes, FramePlanes::Rgb { plane, .. }
             if plane.format() == wgpu::TextureFormat::Bgra8Unorm)
             && frame.color.transfer == Transfer::Srgb
-            && frame.color.primaries == Primaries::Bt709
-            && frame_surface(frame).is_some()
+            && frame.color.primaries == Primaries::Bt709;
+        let ring = matches!(&frame.planes, FramePlanes::Rgb { plane, .. }
+            if plane.format() == wgpu::TextureFormat::Rgba16Float)
+            && frame.color.transfer == Transfer::Linear
+            && frame.color.primaries == Primaries::DisplayP3;
+        (video || ring) && frame_surface(frame).is_some()
     }
 }
 

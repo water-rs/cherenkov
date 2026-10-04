@@ -7,7 +7,6 @@
 
 #[cfg(target_arch = "wasm32")]
 use crate::local::Sender;
-use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
@@ -22,16 +21,14 @@ use rustc_hash::FxHashMap;
 
 use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo, Visibility};
-use crate::capability::{
-    Backdrop, BackdropChain, BackdropRuns, ExternalFrames, GpuContent, ProjectiveLayers,
-};
+use crate::capability::{Backdrop, BackdropChain, BackdropRuns, ProjectiveLayers};
 use crate::engine::SurfaceWaker;
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::Readback;
 use crate::message::{
     BackdropId, ChangeSet, ContentOp, LayerId, LayerOp, Message, Op, Prop, SurfaceId,
 };
-use crate::record::{Content, ContentSpare, Live, LiveOwner};
+use crate::record::{Binding, Content, ContentSpare, Live, LiveOwner, SampleFlag};
 use crate::shape::{Shape, ShapeData};
 use crate::size::LayoutSize;
 use crate::style::{BlendMode, FilterId};
@@ -89,7 +86,7 @@ pub struct Shared<B: Backend> {
     /// Live property subscriptions, keyed by layer and property. Binding a
     /// property replaces its previous subscription; dropping a layer drops
     /// them all.
-    bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
+    bindings: FxHashMap<(u64, PropKind), Binding>,
     /// The surface's host wake-up, fired when an op is queued outside a
     /// frame; silent while the surface is hidden.
     waker: Arc<SurfaceWaker>,
@@ -98,10 +95,10 @@ pub struct Shared<B: Backend> {
     tx: Sender<Message<B>>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
-    /// Set by installed contents' `LiveState`s the moment an animated
+    /// Set by installed contents' live states the moment an animated
     /// operand arrives, so [`Shared::take_changes`] skips per-content
     /// sampling probes on surfaces that never saw one.
-    animated: Rc<Cell<bool>>,
+    animated: SampleFlag,
     /// The `LiveOwner` handle installed contents attach to, created on
     /// first install and held for the surface's life.
     owner: Option<Rc<dyn LiveOwner>>,
@@ -140,17 +137,14 @@ impl<B: Backend> Shared<B> {
             waker,
             tx,
             display: Cell::new(Display::default()),
-            animated: Rc::new(Cell::new(false)),
+            animated: SampleFlag::new(),
             owner: None,
         }
     }
 
     /// `layer`'s layout size.
     fn layout_size(&mut self, layer: LayerId) -> LayoutSize {
-        self.sizes
-            .entry(layer)
-            .or_insert_with(LayoutSize::new)
-            .clone()
+        self.sizes.entry(layer).or_default().clone()
     }
 
     /// Queues an op outside a frame.
@@ -218,11 +212,11 @@ impl<B: Backend> Shared<B> {
                 continue;
             };
             // The sample queues the operands' per-frame values, so
-            // `take_change` emits them like signal updates. The cell read
-            // keeps a static content at a field probe, not a call.
+            // `take_change` emits them like signal updates. The flag read
+            // keeps a static content at a probe, not a call.
             if let Some(time) = sampling
-                && content.live.needs_sample.get()
-                && content.sample(time)
+                && content.needs_sample()
+                && content.sample(time).is_animating()
             {
                 animating = true;
             }
@@ -239,7 +233,7 @@ impl<B: Backend> Shared<B> {
         let clear = self.clear.take();
         if sampling.is_some() && !animating {
             // Nothing sampled this pass: the flag stays down until an
-            // `animate` pokes it up again.
+            // animated change pokes it up again.
             self.animated.set(false);
         }
         if clear.is_some() || !ops.is_empty() || !recycled.is_empty() {
@@ -260,26 +254,28 @@ impl<B: Backend> Shared<B> {
         self.spare_ops = ops;
         for (layer, picture) in recycled.drain(..) {
             if let Some(slot) = self.contents.get_mut(&layer) {
-                slot.spare.picture = Some(picture);
+                slot.spare.put_picture(picture);
             }
         }
         self.spare_recycled = std::mem::take(recycled);
     }
 
-    /// Binds `subscribe` so changes queue `op(layer, value, animation)` and
-    /// fire the waker. Replaces the property's previous binding.
+    /// Binds `live` so its later changes queue `op(layer, value, animation)`
+    /// and fire the waker, returning the value the binding starts from.
+    /// Replaces the property's previous binding.
     fn bind<T, F>(
         shared: &Rc<RefCell<Self>>,
         layer: LayerId,
         kind: PropKind,
-        subscribe: crate::record::Subscribe<T>,
+        live: Live<T>,
         op: F,
-    ) where
+    ) -> T
+    where
         T: 'static,
         F: Fn(LayerId, T, Option<Animation>) -> LayerOp + 'static,
     {
         let weak = Rc::downgrade(shared);
-        let guard = subscribe.start(crate::record::Watch::binding(move |context: Context<T>| {
+        let (target, guard) = live.watch(move |context: Context<T>| {
             let animation = context.metadata().try_get::<Animation>();
             let target = context.into_value();
             if let Some(shared) = weak.upgrade() {
@@ -287,7 +283,7 @@ impl<B: Backend> Shared<B> {
                     .borrow_mut()
                     .push(Op::Layer(op(layer, target, animation)));
             }
-        }));
+        });
         let mut shared_mut = shared.borrow_mut();
         if let Some(guard) = guard {
             shared_mut.bindings.insert((layer.raw(), kind), guard);
@@ -296,6 +292,7 @@ impl<B: Backend> Shared<B> {
             // replaced by this subscription.
             shared_mut.bindings.remove(&(layer.raw(), kind));
         }
+        target
     }
 
     /// Drops the subscription bound to `layer`'s `kind`, if any.
@@ -383,15 +380,12 @@ pub enum LayerContent<B: Backend> {
     Content(Content),
     /// A shared immutable picture.
     Picture(Picture),
-    /// An opaque render-side install (GPU content, external frames). The
-    /// closure learns the surface and layer it is installed on when the
-    /// edit is applied in `update`.
+    /// An opaque render-side install (GPU producers). The closure learns
+    /// the surface and layer it is installed on when the edit is applied
+    /// in `update`, and reports the installed content's declared alpha —
+    /// `None` before the producer's first frame — which the layer's
+    /// alpha contract notes.
     Install(InstallOp<B>),
-    /// An external frame's install — opaque like [`Install`](Self::Install),
-    /// but lowered to [`Op::ExternalFrame`] so the render loop can tell a
-    /// plane-eligible frame swap from any other change. The payload is
-    /// constructible only inside the crate (#90).
-    ExternalFrame(ExternalFrameInstall<B>),
     /// Nothing.
     None,
 }
@@ -408,76 +402,16 @@ impl<B: Backend> From<Picture> for LayerContent<B> {
     }
 }
 
-/// Custom GPU content of a fixed size, attachable to a layer. Created by
-/// [`Engine::gpu_content`](crate::Engine::gpu_content). Not `Clone`.
-pub struct GpuContentHandle<B: GpuContent> {
-    /// The content size in pixels.
-    pub size: (u32, u32),
-    /// The content object; backend content types may expose handles of
-    /// their own (e.g. a redraw requester).
-    pub content: B::Content,
-}
-
-impl<B: GpuContent> From<GpuContentHandle<B>> for LayerContent<B> {
-    fn from(handle: GpuContentHandle<B>) -> Self {
-        let GpuContentHandle { size, content } = handle;
-        Self::Install(Box::new(move |r, surface, layer| {
-            B::set_gpu_content(r, surface, layer, size, content);
-        }))
-    }
-}
-
-/// An externally produced frame (video, web views), attachable to a
-/// layer. Created by
-/// [`Engine::external_frame`](crate::Engine::external_frame). Not `Clone`.
-pub struct ExternalFrameHandle<B: ExternalFrames> {
-    /// The frame object.
-    pub(crate) frame: B::Frame,
-}
-
-impl<B: ExternalFrames> From<ExternalFrameHandle<B>> for LayerContent<B> {
-    fn from(handle: ExternalFrameHandle<B>) -> Self {
-        let frame = handle.frame;
-        let opaque = B::frame_opaque(&frame);
-        Self::ExternalFrame(ExternalFrameInstall::new(
-            Box::new(move |r, surface, layer| {
-                B::set_external_frame(r, surface, layer, frame);
-            }),
-            opaque,
-        ))
-    }
-}
-
-/// An external frame's install.
-///
-/// Only [`Engine::external_frame`]'s handle produces one, so a commit
-/// records a layer in `plane_frames` only for a real frame swap — an
-/// arbitrary renderer mutation wrapped in [`LayerContent::Install`]
-/// still takes the full path (#90).
-pub struct ExternalFrameInstall<B: Backend> {
-    op: InstallOp<B>,
-    /// Whether the frame's declared alpha contract is fully opaque.
-    opaque: bool,
-}
-
-impl<B: Backend> ExternalFrameInstall<B> {
-    pub(crate) fn new(op: InstallOp<B>, opaque: bool) -> Self {
-        Self { op, opaque }
-    }
-
-    /// Runs the install on the render thread.
-    pub(crate) fn install(self, renderer: &mut B::Renderer, surface: SurfaceId, layer: LayerId) {
-        (self.op)(renderer, surface, layer);
-    }
-}
-
-/// An opaque render-side install a [`GpuContent`] or [`ExternalFrames`]
+/// An opaque render-side install a [`GpuContent`](crate::GpuContent)
 /// capability wraps; the closure learns its surface and layer at apply
-/// time.
+/// time and reports the installed content's declared alpha — `Some`
+/// once a frame landed, `None` before — for the layer's alpha contract.
 #[cfg(not(target_arch = "wasm32"))]
-type InstallOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId) + Send>;
+type InstallOp<B> =
+    Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId) -> Option<bool> + Send>;
 #[cfg(target_arch = "wasm32")]
-type InstallOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId)>;
+type InstallOp<B> =
+    Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId) -> Option<bool>>;
 
 /// A recorded layer edit inside a [`Transaction`].
 enum EditOp<B: Backend> {
@@ -520,24 +454,6 @@ pub struct LayerEdit<B: Backend> {
     default_animation: Option<Animation>,
 }
 
-impl<B: GpuContent> LayerEdit<B> {
-    /// Resizes the retained GPU attachment, preserving the producer and setup.
-    /// The backend reports unsupported dimensions on rendering.
-    ///
-    /// # Panics
-    /// If either dimension is zero, or the layer has no GPU content when applied.
-    pub fn gpu_content_size(&mut self, size: (u32, u32)) -> &mut Self {
-        assert!(size.0 > 0 && size.1 > 0, "GPU content size must be nonzero");
-        self.ops
-            .push(EditOp::Content(LayerContent::Install(Box::new(
-                move |renderer, surface, layer| {
-                    B::resize_gpu_content(renderer, surface, layer, size);
-                },
-            ))));
-        self
-    }
-}
-
 impl<B: ProjectiveLayers> LayerEdit<B> {
     /// Makes the layer projective with `value` as its projection base.
     ///
@@ -557,15 +473,14 @@ impl<B: ProjectiveLayers> LayerEdit<B> {
     /// flips with [`Self::tilt`], [`Self::depth`] and the affine
     /// components.
     pub fn projection(&mut self, value: impl Into<Live<crate::Projective>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Projection(live.value));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Projection,
-            live.subscribe,
+            value.into(),
             |layer, target, _| LayerOp::Projection(layer, target),
         );
+        self.ops.push(EditOp::Projection(target));
         self
     }
 
@@ -577,18 +492,17 @@ impl<B: ProjectiveLayers> LayerEdit<B> {
     /// becomes projective with an identity base (an orthographic depth
     /// rotation).
     pub fn tilt(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Tilt(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Tilt,
-            live.subscribe,
+            value.into(),
             |layer, target, animation| LayerOp::Tilt(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Tilt(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
@@ -596,18 +510,17 @@ impl<B: ProjectiveLayers> LayerEdit<B> {
     /// zero. Positive values move toward the viewer. Like [`Self::tilt`],
     /// it makes the layer projective.
     pub fn depth(&mut self, value: impl Into<Live<f64>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Depth(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Depth,
-            live.subscribe,
+            value.into(),
             |layer, target, animation| LayerOp::Depth(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Depth(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
@@ -625,18 +538,17 @@ impl<B: ProjectiveLayers> LayerEdit<B> {
 impl<B: Backend> LayerEdit<B> {
     /// Sets the local transform.
     pub fn transform(&mut self, transform: impl Into<Live<Affine>>) -> &mut Self {
-        let live = transform.into();
-        self.ops.push(EditOp::Transform(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Transform,
-            live.subscribe,
+            transform.into(),
             |layer, target, animation| LayerOp::Transform(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Transform(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
@@ -645,18 +557,17 @@ impl<B: Backend> LayerEdit<B> {
     /// documented in `docs/api.md`. Each keeps its own live subscription and
     /// animation track; changing it never re-records content.
     pub fn translation(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Translation(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Translation,
-            live.subscribe,
+            value.into(),
             |layer, target, animation| LayerOp::Translation(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Translation(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
@@ -667,18 +578,17 @@ impl<B: Backend> LayerEdit<B> {
     /// documented in `docs/api.md`. Each keeps its own live subscription and
     /// animation track; changing it never re-records content.
     pub fn rotation(&mut self, value: impl Into<Live<f64>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Rotation(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Rotation,
-            live.subscribe,
+            value.into(),
             |layer, target, animation| LayerOp::Rotation(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Rotation(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
@@ -687,18 +597,17 @@ impl<B: Backend> LayerEdit<B> {
     /// documented in `docs/api.md`. Each keeps its own live subscription and
     /// animation track; changing it never re-records content.
     pub fn scale(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Scale(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Scale,
-            live.subscribe,
+            value.into(),
             |layer, target, animation| LayerOp::Scale(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Scale(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
@@ -708,18 +617,17 @@ impl<B: Backend> LayerEdit<B> {
     /// documented in `docs/api.md`. Each keeps its own live subscription and
     /// animation track; changing it never re-records content.
     pub fn skew(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Skew(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Skew,
-            live.subscribe,
+            value.into(),
             |layer, target, animation| LayerOp::Skew(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Skew(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
@@ -728,67 +636,62 @@ impl<B: Backend> LayerEdit<B> {
     /// documented in `docs/api.md`. Each keeps its own live subscription and
     /// animation track; changing it never re-records content.
     pub fn pivot(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
-        let live = value.into();
-        self.ops.push(EditOp::Pivot(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Pivot,
-            live.subscribe,
+            value.into(),
             |layer, target, animation| LayerOp::Pivot(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Pivot(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
     /// Sets the opacity.
     pub fn opacity(&mut self, opacity: impl Into<Live<f32>>) -> &mut Self {
-        let live = opacity.into();
-        self.ops.push(EditOp::Opacity(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Opacity,
-            live.subscribe,
+            opacity.into(),
             |layer, target, animation| LayerOp::Opacity(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::Opacity(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
     /// Sets the scroll offset.
     pub fn scroll_offset(&mut self, offset: impl Into<Live<Vec2>>) -> &mut Self {
-        let live = offset.into();
-        self.ops.push(EditOp::ScrollOffset(Prop {
-            target: live.value,
-            animation: self.default_animation,
-        }));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::ScrollOffset,
-            live.subscribe,
+            offset.into(),
             |layer, target, animation| LayerOp::ScrollOffset(layer, Prop { target, animation }),
         );
+        self.ops.push(EditOp::ScrollOffset(Prop {
+            target,
+            animation: self.default_animation,
+        }));
         self
     }
 
     /// Sets the clip shape, applied in the layer's own space.
     pub fn clip<S: Shape + 'static>(&mut self, shape: impl Into<Live<S>>) -> &mut Self {
-        let live = shape.into();
-        self.ops
-            .push(EditOp::Clip(Some(ShapeData::of(&live.value))));
-        Shared::bind(
+        let target = Shared::bind(
             &self.shared,
             self.layer,
             PropKind::Clip,
-            live.subscribe,
+            shape.into(),
             |layer, shape: S, _| LayerOp::Clip(layer, Some(ShapeData::of(&shape))),
         );
+        self.ops.push(EditOp::Clip(Some(ShapeData::of(&target))));
         self
     }
 
@@ -846,7 +749,7 @@ impl<B: Backend> LayerEdit<B> {
             (spare, shared.layout_size(self.layer))
         };
         self.ops.push(EditOp::Content(LayerContent::Content(
-            Content::record_reusing(spare, size, body),
+            Content::record_into(spare, &size, body),
         )));
         self
     }
@@ -865,14 +768,10 @@ impl<B: Backend> LayerEdit<B> {
     /// metadata, like any animated operand; it is not a render-thread
     /// property, so [`animation`](Self::animation) does not apply to it.
     pub fn layout_size(&mut self, size: impl Into<Live<Size>>) -> &mut Self {
-        let live = size.into();
         let target = self.shared.borrow_mut().layout_size(self.layer);
-        target.set(&LayoutSize::change(live.value, self.default_animation));
-        let guard = live
-            .subscribe
-            .start(crate::record::Watch::binding(move |change| {
-                target.set(&change);
-            }));
+        let bound = target.clone();
+        let (value, guard) = size.into().watch(move |change| bound.set(&change));
+        target.set(&LayoutSize::change(value, self.default_animation));
         let key = (self.layer.raw(), PropKind::LayoutSize);
         {
             let mut shared = self.shared.borrow_mut();
@@ -1218,7 +1117,7 @@ impl<B: Backend> Surface<B> {
     #[must_use]
     pub fn record(&self, body: impl FnOnce(&mut crate::Recorder)) -> Content {
         let size = self.shared.borrow_mut().layout_size(self.root.id);
-        Content::record(size, body)
+        Content::record(&size, body)
     }
 
     /// Queues a transaction's edits into the surface's change set. Nothing
@@ -1272,8 +1171,8 @@ impl<B: Backend> Surface<B> {
         let pending = std::mem::take(&mut shared.pending);
         let mut ops = pending;
         // Cloned once per transaction: installed contents attach the
-        // surface and its sampling flag to their `LiveState`s.
-        let animated = Rc::clone(&shared.animated);
+        // surface and its sampling flag to their live states.
+        let animated = shared.animated.clone();
         for (id, edit) in &mut tx.edits {
             for op in edit.ops.drain(..) {
                 match op {
@@ -1321,10 +1220,10 @@ impl<B: Backend> Surface<B> {
                             .clone();
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
-                            slot.spare.live = previous.retire().live;
+                            slot.spare.merge(previous.retire());
                         }
                         let stored = slot.content.as_mut().expect("just inserted");
-                        stored.attach_owner(Rc::downgrade(&owner), &animated);
+                        stored.attach(Rc::downgrade(&owner), &animated);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),
@@ -1344,22 +1243,10 @@ impl<B: Backend> Surface<B> {
                         shared.contents.remove(id);
                         let surface = self.id;
                         let layer = *id;
-                        ops.push(Op::Installed(layer));
-                        ops.push(Op::Install(Box::new(move |r| {
-                            install(r, surface, layer);
-                        })));
-                    }
-                    EditOp::Content(LayerContent::ExternalFrame(install)) => {
-                        shared.contents.remove(id);
-                        let surface = self.id;
-                        let layer = *id;
-                        ops.push(Op::ExternalFrame {
+                        ops.push(Op::Install(
                             layer,
-                            opaque: install.opaque,
-                            install: Box::new(move |r| {
-                                install.install(r, surface, layer);
-                            }),
-                        });
+                            Box::new(move |r| install(r, surface, layer)),
+                        ));
                     }
                     EditOp::Content(LayerContent::None) => {
                         shared.contents.remove(id);

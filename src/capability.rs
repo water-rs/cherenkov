@@ -13,7 +13,7 @@ use crate::ShaderId;
 use crate::backend::Backend;
 use crate::error::ResourceError;
 use crate::image::Format;
-use crate::message::{BackdropId, BackdropShaderId, LayerId, SurfaceId};
+use crate::message::{BackdropId, BackdropShaderId, LayerId, ProducerId, SurfaceId};
 use crate::style::FilterId;
 
 /// The backend draws user WGSL shader paints.
@@ -73,43 +73,90 @@ pub trait Effects: Filters {
     fn add_effect(r: &mut Self::Renderer, id: FilterId, effect: Self::Effect);
 }
 
-/// The backend composites user GPU-rendered content as layer content.
+/// The backend composites user GPU content as layer content.
+///
+/// A producer lives at renderer scope, not on a surface: one
+/// [`GpuProducer`](crate::GpuProducer) can be bound to layers of any number of
+/// the engine's surfaces, and every binding samples the producer's one
+/// current frame. Rendered and submitted pixels are that one frame path:
+/// a rendered producer draws into a buffer from the renderer-owned frame
+/// ring and a [`FrameSink`](crate::FrameSink)'s producer takes the frame
+/// its owner submits.
 pub trait GpuContent: Backend {
-    /// The content payload type.
+    /// The rendered producer's content payload type.
     type Content: crate::RenderTransfer + 'static;
-    /// Resizes an installed producer's attachment without repeating setup.
-    /// Called in transaction order; the layer must contain GPU content.
-    fn resize_gpu_content(
-        r: &mut Self::Renderer,
-        surface: SurfaceId,
-        layer: LayerId,
-        size: (u32, u32),
-    );
-    /// Attaches GPU content to a layer.
-    fn set_gpu_content(
-        r: &mut Self::Renderer,
-        surface: SurfaceId,
-        layer: LayerId,
-        size: (u32, u32),
-        content: Self::Content,
-    );
-}
-
-/// The backend consumes externally produced frames (video, web views).
-pub trait ExternalFrames: Backend {
-    /// The frame payload type.
+    /// The frame payload a [`FrameSink`](crate::FrameSink) submits
+    /// (`ExternalFrame` on the wgpu backend).
     type Frame: crate::RenderTransfer + 'static;
     /// Whether `frame`'s declared alpha contract is fully opaque — only
     /// then does a planes-capable backend know the layer's coverage
     /// without compositing it (#90).
     fn frame_opaque(frame: &Self::Frame) -> bool;
-    /// Attaches an external frame to a layer.
-    fn set_external_frame(
+    /// Registers the producer `producer`'s content on the render thread,
+    /// before any binding of it is drawn. Its frame ring is allocated by
+    /// each surface's compositor contract, not set up here.
+    fn add_gpu_producer(r: &mut Self::Renderer, producer: ProducerId, content: Self::Content);
+    /// Registers `producer` as a submitted-frame producer — the kind whose
+    /// frames come from [`FrameSink::submit`](crate::FrameSink::submit).
+    /// `dirty` and `gate` are the sink's shared wake state: the sink marks
+    /// the producer dirty on each submit and the render loop drives the
+    /// gate with the visibility of the surfaces drawing its bindings.
+    fn add_frame_producer(
+        r: &mut Self::Renderer,
+        producer: ProducerId,
+        dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        gate: std::sync::Arc<crate::WakeGate>,
+    );
+    /// Binds `producer` to `layer` of `surface` at `size` pixels — the
+    /// binding samples `ImageSource::Content(producer)`, the producer's
+    /// current frame, and becomes a `Source::Frame` candidate for the
+    /// surface's `planes::plan`. A size change is a new binding.
+    ///
+    /// Returns the current frame's declared alpha for the layer's alpha
+    /// contract: `Some(opaque)` once a frame has landed — a rendered
+    /// producer's premultiplied ring frame reports `false` — and `None`
+    /// before the first, so the layer is noted not known opaque.
+    fn bind_gpu_producer(
         r: &mut Self::Renderer,
         surface: SurfaceId,
         layer: LayerId,
+        producer: &crate::GpuProducer<Self>,
+        size: (u32, u32),
+    ) -> Option<bool>;
+    /// Installs `frame` as `producer`'s current frame and returns the
+    /// `(surface, layer)` pairs it is bound on, so the frame's declared
+    /// alpha contract is noted on each of them. A frame producer has no
+    /// setup: a frame submitted after a device replacement supplies the
+    /// first frame on the new device.
+    fn submit_frame(
+        r: &mut Self::Renderer,
+        producer: ProducerId,
         frame: Self::Frame,
-    );
+    ) -> Vec<(SurfaceId, LayerId)>;
+    /// Retires `producer`, the last `GpuProducer` handle having dropped:
+    /// every binding releases it and its device resources — current frame
+    /// and frame ring — are freed.
+    fn retire_gpu_producer(r: &mut Self::Renderer, producer: ProducerId);
+    /// The device-replacement contract: drains every live producer,
+    /// dropping the device resources the current device made. A rendered
+    /// producer returns its content for the new renderer to re-register;
+    /// a frame producer's frame is device state and drops with the old
+    /// device — the sink's next submit supplies a frame on the new device.
+    /// Also releases every binding.
+    fn drain_gpu_producers(r: &mut Self::Renderer) -> Vec<(ProducerId, DrainedProducer<Self>)>;
+}
+
+/// What a device replacement hands back for one drained producer
+/// ([`GpuContent::drain_gpu_producers`]).
+pub enum DrainedProducer<B: GpuContent> {
+    /// A rendered producer's content, to re-register with
+    /// [`Engine::gpu_producer`](crate::Engine::gpu_producer) on the new
+    /// renderer.
+    Rendered(B::Content),
+    /// A submitted-frame producer: its frame dropped with the old device.
+    /// Recreate the pair with [`Engine::frame_producer`](crate::Engine::frame_producer)
+    /// and submit again.
+    Frame,
 }
 
 /// Which image storage formats `add_image` accepts: the backend uploads

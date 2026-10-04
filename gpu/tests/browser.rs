@@ -128,7 +128,7 @@ async fn local_producers_share_device_and_preserve_wakes_during_await() {
         tx[surface.root()].push(&layer);
         tx[&layer]
             .transform(cherenkov::kurbo::Affine::translate((8., 0.)))
-            .content(engine.gpu_content((8, 16), producer));
+            .content(engine.gpu_producer(producer).at((8, 16)));
     });
     let before = wakes.get();
     engine
@@ -501,7 +501,8 @@ fn show_frame(
     color: FrameColor,
     at: (f64, f64),
 ) -> cherenkov::Layer {
-    let frame = engine.external_frame(
+    let (video, sink) = engine.frame_producer();
+    sink.submit(
         ExternalFrame::rgb(plane.clone(), alpha, color).expect("plane meets the frame contract"),
     );
     let layer = surface.layer();
@@ -509,7 +510,7 @@ fn show_frame(
         tx[surface.root()].push(&layer);
         tx[&layer]
             .transform(cherenkov::kurbo::Affine::translate(at))
-            .content(frame);
+            .content(video.at((plane.width(), plane.height())));
     });
     layer
 }
@@ -523,11 +524,12 @@ fn replace_frame(
     alpha: RgbAlpha,
     color: FrameColor,
 ) {
-    let frame = engine.external_frame(
+    let (video, sink) = engine.frame_producer();
+    sink.submit(
         ExternalFrame::rgb(plane.clone(), alpha, color).expect("plane meets the frame contract"),
     );
     surface.update(|tx| {
-        tx[layer].content(frame);
+        tx[layer].content(video.at((plane.width(), plane.height())));
     });
 }
 

@@ -52,7 +52,8 @@ pub use crate::paint::{
     ShaderId, ShaderPaint, SweepGradient, TransformedPaint,
 };
 pub use crate::record::{
-    Content, ContentChange, Draw, Fixed, Live, LiveOwner, Recorder, StaticRecorder,
+    Animating, Binding, Content, ContentChange, ContentSpare, Draw, Fixed, Live, LiveOwner,
+    Recorder, SampleFlag, StaticRecorder,
 };
 pub use crate::resource::{BackdropShaderId, ResourceId};
 pub use crate::shape::{

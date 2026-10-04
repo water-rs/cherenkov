@@ -14,7 +14,7 @@ use cherenkov::{FillRule, GlyphRun, ShapeData, WorkingColor};
 use cherenkov::RenderError;
 
 use crate::names;
-use cherenkov::{LayerId, SurfaceTree};
+use cherenkov::{LayerId, ProducerId, SurfaceTree};
 
 use crate::render::GpuImage;
 use crate::render::filter::FilterKey;
@@ -90,11 +90,12 @@ pub enum ShaderVariant {
 pub enum ImageSource {
     Registered(u64),
     Bitmap(super::bitmap::BitmapKey),
-    Content(LayerId),
+    /// The current frame a producer's bindings share
+    /// (`cherenkov::GpuContent`), by `ProducerId`: the range draws the
+    /// external pipeline against the producer's slot bind, not
+    /// `image_tex`.
+    Content(ProducerId),
     Shader(std::sync::Arc<super::paint::Key>),
-    /// A retained external frame bound to `LayerId`: the range draws the
-    /// external pipeline against that layer's slot bind, not `image_tex`.
-    External(LayerId),
 }
 
 /// One draw call's instance range and bound source texture.
@@ -162,9 +163,13 @@ pub struct Frame {
     pub stops: Vec<Stop>,
     /// Passes in submission order.
     pub passes: Vec<Pass>,
-    pub content: Vec<LayerId>,
-    /// External-frame layers composed this frame, in paint order.
-    pub external: Vec<LayerId>,
+    /// Producer bindings drawn this frame, composited in-engine or
+    /// promoted to a plane: `(producer, requested size)`, one entry per
+    /// drawn binding — a producer can appear once per binding.
+    pub content: Vec<(ProducerId, (u32, u32))>,
+    /// Producers whose current frame composed on this frame, in paint
+    /// order — rendered and submitted alike.
+    pub external: Vec<ProducerId>,
     pub filters: Vec<(usize, FilterKey)>,
     pub shadows: Vec<(usize, super::shadow::Parameters)>,
     /// Local images whose mip chains build after the pass at the index:
@@ -775,9 +780,9 @@ pub struct GlyphContext<'a> {
     pub images: &'a FxHashMap<u64, GpuImage>,
     /// Decoded bitmap glyph textures.
     pub bitmaps: &'a FxHashMap<super::bitmap::BitmapKey, super::GpuBitmap>,
-    pub content: &'a FxHashMap<LayerId, super::gpu_content::Slot>,
-    /// Retained external frames, for the emitted quad's plane size.
-    pub external: &'a FxHashMap<LayerId, super::external::Slot>,
+    /// Producer bindings by layer (`cherenkov::GpuContent`): the quad
+    /// each emits samples the producer's current frame.
+    pub content: &'a FxHashMap<LayerId, super::gpu_content::Binding>,
 }
 
 /// One surface's lowering output: the raster counts plus every deferred
@@ -2636,6 +2641,13 @@ impl<'a> Lowering<'a> {
         caches: &mut FxHashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
+        let binding = glyphs.content.get(&id);
+        if let Some(binding) = binding {
+            // The frame's drawn bindings, whether the layer composites
+            // in-engine or promotes to a plane: the redraw and
+            // wake-gate checks read them from the lowered frame.
+            self.frame.content.push((binding.producer(), binding.size));
+        }
         if self.promoted.contains(&id) {
             if self.opens.contains(&id) {
                 self.next_part();
@@ -2658,47 +2670,44 @@ impl<'a> Lowering<'a> {
             )?;
             self.layers_composed += u32::from(changed);
         }
-        if let Some(slot) = glyphs.content.get(&id) {
-            self.frame.content.push(id);
-            let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
-            if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
-                let transform = self.transform * boxed.extra;
-                let mut inst = self.base(KIND_FILL, affine(transform));
-                let margin = self.margin(self.transform);
-                let b = boxed.bounds.inflate(margin, margin);
-                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
-                inst.shape = boxed.shape;
-                inst.meta[1] = super::instance::PAINT_IMAGE;
-                inst.grad = [1.0, 0.0, 0.0, 1.0];
-                inst.grad2 = [
-                    f32_f64(bounds.width() / 2.0),
-                    f32_f64(bounds.height() / 2.0),
-                    f32_f64(bounds.width()),
-                    f32_f64(bounds.height()),
-                ];
-                inst.meta[3] |=
-                    super::instance::EXTEND_PAD | (super::instance::EXTEND_PAD << 4) | (1 << 8);
-                self.set_image(Some(ImageSource::Content(id)));
-                self.push_shaped(inst, transform, boxed.bounds, margin);
-            }
-        }
-        if let Some(slot) = glyphs.external.get(&id) {
-            self.frame.external.push(id);
-            let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
-            if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
-                let transform = self.transform * boxed.extra;
-                let mut inst = self.base(KIND_FILL, affine(transform));
-                let margin = self.margin(self.transform);
-                let b = boxed.bounds.inflate(margin, margin);
-                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
-                inst.shape = boxed.shape;
-                // The box is centred on the frame: the fragment stage adds
-                // half the frame size to `in.local` for its pixel coordinate.
-                self.set_image(Some(ImageSource::External(id)));
-                self.push_shaped(inst, transform, boxed.bounds, margin);
-                // The external draw is its own range: following siblings
-                // must not join it, so the bound image returns to none.
-                self.set_image(None);
+        if let Some(binding) = binding {
+            // Every binding of the producer samples its current frame:
+            // the drawn quad is the binding's own size, the frame is the
+            // rendered ring buffer or the submitted planes. The quad is
+            // emitted whether or not a frame has landed yet — the frame
+            // lands after the lower — and the draw is skipped while the
+            // producer has no current frame.
+            if binding.size.0 != 0 && binding.size.1 != 0 {
+                self.frame.external.push(binding.producer());
+                let bounds = Rect::new(
+                    0.0,
+                    0.0,
+                    f64::from(binding.size.0),
+                    f64::from(binding.size.1),
+                );
+                if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
+                    let transform = self.transform * boxed.extra;
+                    let mut inst = self.base(KIND_FILL, affine(transform));
+                    let margin = self.margin(self.transform);
+                    let b = boxed.bounds.inflate(margin, margin);
+                    inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
+                    inst.shape = boxed.shape;
+                    // `cell.zw` carries the quad's own size: the fragment
+                    // scales the frame's pixel coordinate by
+                    // `params.dims / quad` when the binding's size is
+                    // not the frame's (#264).
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "a binding size is a pixel extent within the device limit"
+                    )]
+                    let quad = [binding.size.0 as f32, binding.size.1 as f32, 0.0, 0.0];
+                    inst.uv = quad;
+                    self.set_image(Some(ImageSource::Content(binding.producer())));
+                    self.push_shaped(inst, transform, boxed.bounds, margin);
+                    // The frame draw is its own range: following siblings
+                    // must not join it, so the bound image returns to none.
+                    self.set_image(None);
+                }
             }
         }
         for child in &node.children {
@@ -4454,7 +4463,6 @@ mod tests {
             images: &images,
             bitmaps: &bitmaps,
             content: &FxHashMap::default(),
-            external: &FxHashMap::default(),
         };
         let prefix = cherenkov::Command::Fill {
             shape: ShapeData::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
@@ -4541,7 +4549,6 @@ mod tests {
             images: &images,
             bitmaps: &bitmaps,
             content: &FxHashMap::default(),
-            external: &FxHashMap::default(),
         };
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
@@ -4612,7 +4619,6 @@ mod tests {
             images: &images,
             bitmaps: &bitmaps,
             content: &FxHashMap::default(),
-            external: &FxHashMap::default(),
         };
         let clip = DeviceClip {
             inv: Affine::translate(Vec2::new(-20.0, -20.0)),
@@ -4721,7 +4727,6 @@ mod tests {
             images: &images,
             bitmaps: &bitmaps,
             content: &FxHashMap::default(),
-            external: &FxHashMap::default(),
         };
         // Half extents [20, 5]: a spread of -20 inverts both.
         let bar = ShapeData::Rect(kurbo::Rect::new(20.0, 20.0, 60.0, 30.0));
@@ -4998,7 +5003,6 @@ mod tests {
                 images: &images,
                 bitmaps: &bitmaps,
                 content: &FxHashMap::default(),
-                external: &FxHashMap::default(),
             };
             let mut frame = Frame::default();
             let mut lowering = Lowering::new(&mut frame, (32, 32));

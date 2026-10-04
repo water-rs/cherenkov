@@ -165,9 +165,10 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
     cov *= clip_mask_coverage(in);
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
 
-    // `in.local` is centred on the quad, which spans the frame's pixels:
-    // the frame's pixel coordinate is offset by half its size.
-    let px = in.local + params.dims.xy * 0.5;
+    // `in.local` is centred on the quad. The quad spans the binding's
+    // own size — `in.cell.zw` carries it — which need not be the frame's:
+    // the pixel coordinate scales by `params.dims / quad`.
+    let px = (in.local + in.cell.zw * 0.5) * (params.dims.xy / in.cell.zw);
     var color: vec4<f32>;
     switch params.info.x {
         case KIND_EXT_NV12, KIND_EXT_P010: {

@@ -111,13 +111,18 @@ pub trait GpuContent: Backend {
     /// binding samples `ImageSource::Content(producer)`, the producer's
     /// current frame, and becomes a `Source::Frame` candidate for the
     /// surface's `planes::plan`. A size change is a new binding.
+    ///
+    /// Returns the current frame's declared alpha for the layer's alpha
+    /// contract: `Some(opaque)` once a frame has landed — a rendered
+    /// producer's premultiplied ring frame reports `false` — and `None`
+    /// before the first, so the layer is noted not known opaque.
     fn bind_gpu_producer(
         r: &mut Self::Renderer,
         surface: SurfaceId,
         layer: LayerId,
         producer: &crate::GpuProducer<Self>,
         size: (u32, u32),
-    );
+    ) -> Option<bool>;
     /// Installs `frame` as `producer`'s current frame and returns the
     /// `(surface, layer)` pairs it is bound on, so the frame's declared
     /// alpha contract is noted on each of them. A frame producer has no

@@ -394,15 +394,13 @@ pub fn run<B: Backend>(
             Message::ReplaceImage { id, image } => {
                 replace_image::<B>(&mut renderer, &mut surfaces, &mut resources, id, image);
             }
-            Message::Apply { id, mut changes } => {
-                apply_hidden::<B>(
-                    &mut renderer,
-                    &mut surfaces,
-                    &mut resources,
-                    id,
-                    &mut changes,
-                );
-            }
+            Message::Apply { id, mut changes } => apply_hidden::<B>(
+                &mut renderer,
+                &mut surfaces,
+                &mut resources,
+                id,
+                &mut changes,
+            ),
             Message::Render {
                 time,
                 mut commits,
@@ -418,9 +416,7 @@ pub fn run<B: Backend>(
                     time.0,
                     &mut commits,
                 );
-                // A retirement this frame's unbinds or surface destroys
-                // queued belongs to the frame's batch: the reply tells
-                // the host the frame — retirements included — is done.
+                // This frame's queued retirements belong to its batch.
                 drain_retire::<B>(retire_rx, &mut renderer);
                 let sender = reply.clone();
                 let _ = sender.send(crate::message::RenderReply {
@@ -688,14 +684,13 @@ fn commit<B: Backend>(
                 state.commits = Commits::Other;
                 state.tree.apply(op);
             }
-            Op::Installed(layer) => {
+            Op::Install(layer, install) => {
                 state.commits = Commits::Other;
-                // An arbitrary install declares no alpha contract.
-                state.tree.note_installed(layer, false);
-            }
-            Op::Install(install) => {
-                state.commits = Commits::Other;
-                install(&mut *renderer);
+                // The install reports its content's declared alpha —
+                // `None` before its first frame — noted on the layer.
+                state
+                    .tree
+                    .note_installed(layer, install(&mut *renderer).unwrap_or(false));
             }
         }
     }

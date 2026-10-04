@@ -380,9 +380,11 @@ pub enum LayerContent<B: Backend> {
     Content(Content),
     /// A shared immutable picture.
     Picture(Picture),
-    /// An opaque render-side install (GPU content). The closure learns
+    /// An opaque render-side install (GPU producers). The closure learns
     /// the surface and layer it is installed on when the edit is applied
-    /// in `update`.
+    /// in `update`, and reports the installed content's declared alpha —
+    /// `None` before the producer's first frame — which the layer's
+    /// alpha contract notes.
     Install(InstallOp<B>),
     /// Nothing.
     None,
@@ -402,11 +404,14 @@ impl<B: Backend> From<Picture> for LayerContent<B> {
 
 /// An opaque render-side install a [`GpuContent`](crate::GpuContent)
 /// capability wraps; the closure learns its surface and layer at apply
-/// time.
+/// time and reports the installed content's declared alpha — `Some`
+/// once a frame landed, `None` before — for the layer's alpha contract.
 #[cfg(not(target_arch = "wasm32"))]
-type InstallOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId) + Send>;
+type InstallOp<B> =
+    Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId) -> Option<bool> + Send>;
 #[cfg(target_arch = "wasm32")]
-type InstallOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId)>;
+type InstallOp<B> =
+    Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId) -> Option<bool>>;
 
 /// A recorded layer edit inside a [`Transaction`].
 enum EditOp<B: Backend> {
@@ -1238,10 +1243,10 @@ impl<B: Backend> Surface<B> {
                         shared.contents.remove(id);
                         let surface = self.id;
                         let layer = *id;
-                        ops.push(Op::Installed(layer));
-                        ops.push(Op::Install(Box::new(move |r| {
-                            install(r, surface, layer);
-                        })));
+                        ops.push(Op::Install(
+                            layer,
+                            Box::new(move |r| install(r, surface, layer)),
+                        ));
                     }
                     EditOp::Content(LayerContent::None) => {
                         shared.contents.remove(id);

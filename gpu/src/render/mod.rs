@@ -3796,6 +3796,11 @@ impl GpuRenderer {
         self.frame_pass_count = 0;
         self.frame_submission = None;
         self.pass_meta.clear();
+        // Produce, then plan, then lower and encode: a rendered
+        // producer's new ring frame must be its current frame before
+        // `ready_planes`/`lower_content` build this frame's plane
+        // candidates, and one render serves every dirty surface.
+        self.render_producers(&dirty, frame.time.0).await?;
         // Lower every dirty surface first: the GPU timestamp bracket must
         // start after CPU lowering (rasters, uploads) so it measures GPU
         // work only. Instances, stops and globals are appended frame-wide
@@ -3855,7 +3860,6 @@ impl GpuRenderer {
                     sf.id,
                     frame.time.0.saturating_duration_since(origin).as_secs_f32(),
                 )?;
-                self.render_producers(&dirty, frame.time.0).await?;
                 self.prepare_filters(sf.id).await?;
             }
             diag::set_phase("encode");
@@ -3944,6 +3948,11 @@ impl GpuRenderer {
         self.frame_pass_count = 0;
         self.frame_submission = None;
         self.pass_meta.clear();
+        // Produce, then plan, then lower and encode: a rendered
+        // producer's new ring frame must be its current frame before
+        // `ready_planes`/`lower_content` build this frame's plane
+        // candidates, and one render serves every dirty surface.
+        self.render_producers(&dirty, frame.time.0)?;
         // Lower every dirty surface first: the GPU timestamp bracket must
         // start after CPU lowering (rasters, uploads) so it measures GPU
         // work only. Instances, stops and globals are appended frame-wide
@@ -4001,7 +4010,6 @@ impl GpuRenderer {
                     sf.id,
                     frame.time.0.saturating_duration_since(origin).as_secs_f32(),
                 )?;
-                self.render_producers(&dirty, frame.time.0)?;
             }
             diag::set_phase("encode");
             let t = Instant::now();
@@ -4356,9 +4364,13 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Renders every producer a drawn binding asked for this frame:
-    /// bindings across all surfaces fold into one output attachment at
-    /// the componentwise largest requested size, rendered at most once.
+    /// Renders every producer a drawn binding asked for this frame,
+    /// before planning reads its current frame: the wanted set is each
+    /// surface's bindings on the layers the frame's tree draws — a
+    /// producer whose bound layers are all outside the tree renders
+    /// nothing — folded into one output attachment at the componentwise
+    /// largest requested size and scale, rendered at most once per
+    /// engine frame.
     #[cfg(not(target_arch = "wasm32"))]
     #[expect(
         clippy::cast_possible_truncation,
@@ -4372,12 +4384,18 @@ impl GpuRenderer {
         let mut wanted: FxHashMap<ProducerId, ((u32, u32), f32)> = FxHashMap::default();
         for sf in dirty {
             let surface = self.surfaces.get(&sf.id).expect("registered surface");
-            for (id, size) in &surface.frame.content {
+            if surface.bindings.is_empty() {
+                continue;
+            }
+            for (layer, _) in sf.tree.layers() {
+                let Some(binding) = surface.bindings.get(&layer) else {
+                    continue;
+                };
                 let (wanted_size, wanted_scale) = wanted
-                    .entry(*id)
-                    .or_insert((*size, sf.display.scale as f32));
-                wanted_size.0 = wanted_size.0.max(size.0);
-                wanted_size.1 = wanted_size.1.max(size.1);
+                    .entry(binding.producer())
+                    .or_insert((binding.size, sf.display.scale as f32));
+                wanted_size.0 = wanted_size.0.max(binding.size.0);
+                wanted_size.1 = wanted_size.1.max(binding.size.1);
                 *wanted_scale = wanted_scale.max(sf.display.scale as f32);
             }
         }
@@ -4390,14 +4408,13 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// [`render_producers`](Self::render_producers), on the browser
+    /// executor.
     #[cfg(target_arch = "wasm32")]
     #[expect(
         clippy::future_not_send,
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
-    /// Renders every producer a drawn binding asked for this frame:
-    /// bindings across all surfaces fold into one output attachment at
-    /// the componentwise largest requested size, rendered at most once.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "validated display scale fits f32"
@@ -4410,12 +4427,18 @@ impl GpuRenderer {
         let mut wanted: FxHashMap<ProducerId, ((u32, u32), f32)> = FxHashMap::default();
         for sf in dirty {
             let surface = self.surfaces.get(&sf.id).expect("registered surface");
-            for (id, size) in &surface.frame.content {
+            if surface.bindings.is_empty() {
+                continue;
+            }
+            for (layer, _) in sf.tree.layers() {
+                let Some(binding) = surface.bindings.get(&layer) else {
+                    continue;
+                };
                 let (wanted_size, wanted_scale) = wanted
-                    .entry(*id)
-                    .or_insert((*size, sf.display.scale as f32));
-                wanted_size.0 = wanted_size.0.max(size.0);
-                wanted_size.1 = wanted_size.1.max(size.1);
+                    .entry(binding.producer())
+                    .or_insert((binding.size, sf.display.scale as f32));
+                wanted_size.0 = wanted_size.0.max(binding.size.0);
+                wanted_size.1 = wanted_size.1.max(binding.size.1);
                 *wanted_scale = wanted_scale.max(sf.display.scale as f32);
             }
         }
@@ -4556,14 +4579,16 @@ impl GpuRenderer {
 
     /// Binds a layer on `surface` to `producer` at the size the layer
     /// needs (`cherenkov::GpuContent`). A layer has one content kind at a
-    /// time; a size change is a new binding.
+    /// time; a size change is a new binding. Returns the current frame's
+    /// declared alpha for the layer's alpha contract — `None` before the
+    /// producer's first frame.
     pub fn bind_gpu_producer(
         &mut self,
         surface: SurfaceId,
         layer: LayerId,
         producer: &cherenkov::GpuProducer<crate::Gpu>,
         size: (u32, u32),
-    ) {
+    ) -> Option<bool> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
@@ -4578,10 +4603,11 @@ impl GpuRenderer {
             .bindings
             .insert(layer, gpu_content::Binding::new(producer.clone(), size));
         state.interop += 1;
-        assert!(
-            self.producers.contains_key(&producer.id()),
-            "GPU producer registered"
-        );
+        let producer = self.producers.get(&producer.id());
+        assert!(producer.is_some(), "GPU producer registered");
+        producer
+            .and_then(gpu_content::Producer::current)
+            .map(|slot| slot.frame.alpha() == crate::interop::RgbAlpha::Opaque)
     }
 
     /// Releases `layer`'s binding, if any: the bind groups sampling the

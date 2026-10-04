@@ -163,9 +163,9 @@ pub struct Frame {
     pub stops: Vec<Stop>,
     /// Passes in submission order.
     pub passes: Vec<Pass>,
-    /// Producer bindings drawn this frame: `(producer, requested size)`,
-    /// one entry per drawn binding — a producer can appear once per
-    /// binding, and the renderer folds the sizes.
+    /// Producer bindings drawn this frame, composited in-engine or
+    /// promoted to a plane: `(producer, requested size)`, one entry per
+    /// drawn binding — a producer can appear once per binding.
     pub content: Vec<(ProducerId, (u32, u32))>,
     /// Producers whose current frame composed on this frame, in paint
     /// order — rendered and submitted alike.
@@ -2641,6 +2641,13 @@ impl<'a> Lowering<'a> {
         caches: &mut FxHashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
+        let binding = glyphs.content.get(&id);
+        if let Some(binding) = binding {
+            // The frame's drawn bindings, whether the layer composites
+            // in-engine or promotes to a plane: the redraw and
+            // wake-gate checks read them from the lowered frame.
+            self.frame.content.push((binding.producer(), binding.size));
+        }
         if self.promoted.contains(&id) {
             if self.opens.contains(&id) {
                 self.next_part();
@@ -2663,8 +2670,7 @@ impl<'a> Lowering<'a> {
             )?;
             self.layers_composed += u32::from(changed);
         }
-        if let Some(binding) = glyphs.content.get(&id) {
-            self.frame.content.push((binding.producer(), binding.size));
+        if let Some(binding) = binding {
             // Every binding of the producer samples its current frame:
             // the drawn quad is the binding's own size, the frame is the
             // rendered ring buffer or the submitted planes. The quad is

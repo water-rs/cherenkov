@@ -488,8 +488,8 @@ impl cherenkov::GpuContent for Gpu {
         layer: cherenkov::LayerId,
         producer: &cherenkov::GpuProducer<Self>,
         size: (u32, u32),
-    ) {
-        r.bind_gpu_producer(surface, layer, producer, size);
+    ) -> Option<bool> {
+        r.bind_gpu_producer(surface, layer, producer, size)
     }
 
     fn submit_frame(

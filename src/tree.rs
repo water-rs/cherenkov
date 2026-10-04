@@ -623,10 +623,11 @@ impl SurfaceTree {
     }
 
     /// Records installed render-side content (`Op::Install`,
-    /// `Op::ExternalFrame`) replacing what the layer drew: no recorded
-    /// groups remain, and the installed pixels' alpha is the producer's
-    /// to declare — `opaque` is that declaration, `false` where the
-    /// producer declares none, so the layer is not known to be opaque.
+    /// `Message::ProducerFrame`) replacing what the layer drew: no
+    /// recorded groups remain, and the installed pixels' alpha is the
+    /// producer's to declare — `opaque` is that declaration, `false`
+    /// where the producer declares none, so the layer is not known to
+    /// be opaque.
     pub(crate) fn note_installed(&mut self, id: LayerId, opaque: bool) {
         let node = self.node_mut(id);
         node.content_blends = false;

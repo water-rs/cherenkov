@@ -152,7 +152,7 @@ pub trait Renderer: 'static {
       fn frame_opaque(frame: &Self::Frame) -> bool;
       fn add_gpu_producer(r: &mut Self::Renderer, id: ProducerId, content: Self::Content);
       fn add_frame_producer(r: &mut Self::Renderer, id: ProducerId, dirty: Arc<AtomicBool>, gate: Arc<WakeGate>);
-      fn bind_gpu_producer(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, producer: GpuProducer<Self>, size: (u32, u32));
+      fn bind_gpu_producer(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, producer: GpuProducer<Self>, size: (u32, u32)) -> Option<bool>;   // current frame's declared alpha, None before the first
       fn submit_frame(r: &mut Self::Renderer, id: ProducerId, frame: Self::Frame) -> Vec<(SurfaceId, LayerId)>;
       fn retire_gpu_producer(r: &mut Self::Renderer, id: ProducerId);
       fn drain_gpu_producers(r: &mut Self::Renderer) -> Vec<(ProducerId, DrainedProducer<Self>)>;   // device replacement

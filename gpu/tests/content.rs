@@ -689,6 +689,65 @@ fn bindings_size_the_attachment_to_the_larger() -> Result<(), Box<dyn std::error
 }
 }
 
+/// A producer that asks for another frame on every render.
+struct AlwaysProducer {
+    frames: Arc<AtomicUsize>,
+}
+
+impl GpuContent for AlwaysProducer {
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::future_not_send,
+            reason = "the wasm32 harness runs on the single-threaded page event loop"
+        )
+    )]
+    async fn setup(&mut self, _: &wgpu::Context<'_>) {}
+
+    fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        frame.request_redraw();
+    }
+}
+
+split_test! {
+/// A producer that asks for another frame on every render, bound on two
+/// dirty surfaces of one engine, renders exactly once per engine frame —
+/// the produce step folds every dirty surface's drawn bindings (#268).
+fn a_redraw_every_frame_producer_renders_once_per_engine_frame()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let first = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let second = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
+    let first_layer = first.layer();
+    let second_layer = second.layer();
+    let frames = Arc::new(AtomicUsize::new(0));
+    let producer = engine.gpu_producer(GpuContentBox::new(
+        AlwaysProducer {
+            frames: frames.clone(),
+        },
+        || {},
+    ));
+    first.update(|tx| {
+        tx[first.root()].push(&first_layer);
+        tx[&first_layer].content(producer.at((8, 8)));
+    });
+    second.update(|tx| {
+        tx[second.root()].push(&second_layer);
+        tx[&second_layer].content(producer.at((8, 8)));
+    });
+    for frame in 1usize..=3 {
+        wait!(engine.render(FrameTime::now()))?;
+        assert_eq!(
+            frames.load(Ordering::Relaxed),
+            frame,
+            "one render per engine frame across two dirty surfaces"
+        );
+    }
+    Ok(())
+}
+}
+
 split_test! {
 /// A device replacement drains every producer out of the old renderer:
 /// re-registered on the new engine, the producer runs setup exactly once

@@ -186,6 +186,9 @@ pub struct NullRenderer {
 /// A [`Null`] producer: rendered (`content` `Some`) or submitted-frame.
 struct NullProducer {
     content: Option<()>,
+    /// The submitted frame's marker: `Some` once one landed, so a later
+    /// bind reports its declared alpha like the GPU backend's slot.
+    current: Option<()>,
     /// The bindings hold a [`GpuProducer`](crate::GpuProducer) clone
     /// like the GPU backend's `Binding` — a binding's unbind drops the
     /// clone on the render thread, so the last reference can die
@@ -577,6 +580,7 @@ impl crate::GpuContent for Null {
                 id,
                 NullProducer {
                     content: Some(()),
+                    current: None,
                     bindings: FxHashMap::default(),
                 },
             );
@@ -595,6 +599,7 @@ impl crate::GpuContent for Null {
                 id,
                 NullProducer {
                     content: None,
+                    current: None,
                     bindings: FxHashMap::default(),
                 },
             );
@@ -608,7 +613,7 @@ impl crate::GpuContent for Null {
         layer: LayerId,
         producer: &crate::GpuProducer<Self>,
         _size: (u32, u32),
-    ) {
+    ) -> Option<bool> {
         let Some(entry) = r.producers.get_mut(&producer.id()) else {
             panic!("binding of an unknown producer {}", producer.id().raw());
         };
@@ -616,6 +621,7 @@ impl crate::GpuContent for Null {
         let _ = r
             .events
             .send(Event::BindProducer(surface, layer, producer.id()));
+        entry.current.as_ref().map(Self::frame_opaque)
     }
 
     fn submit_frame(
@@ -629,6 +635,7 @@ impl crate::GpuContent for Null {
         let Some(producer) = r.producers.get_mut(&id) else {
             return Vec::new();
         };
+        producer.current = Some(());
         let mut bound: Vec<_> = producer.bindings.keys().copied().collect();
         bound.sort_by_key(|(surface, layer)| (surface.raw(), layer.raw()));
         for &(surface, layer) in &bound {

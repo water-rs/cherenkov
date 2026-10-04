@@ -486,7 +486,7 @@ impl<B: crate::GpuContent> GpuProducer<B> {
     pub fn at(&self, size: (u32, u32)) -> crate::surface::LayerContent<B> {
         let producer = self.clone();
         crate::surface::LayerContent::Install(Box::new(move |r, surface, layer| {
-            B::bind_gpu_producer(r, surface, layer, &producer, size);
+            B::bind_gpu_producer(r, surface, layer, &producer, size)
         }))
     }
 }

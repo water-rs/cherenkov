@@ -34,6 +34,15 @@ pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer) + Send>;
 /// A resource operation that stays on the creating JS thread.
 #[cfg(target_arch = "wasm32")]
 pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer)>;
+/// A render-side install: the closure reports the installed content's
+/// declared alpha — `Some(opaque)` from the producer's current frame,
+/// `None` before one has landed — which the [`Op::Install`] arm notes
+/// on the layer.
+#[cfg(not(target_arch = "wasm32"))]
+pub type InstallApply<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer) -> Option<bool> + Send>;
+/// The owning JS thread's [`InstallApply`].
+#[cfg(target_arch = "wasm32")]
+pub type InstallApply<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer) -> Option<bool>>;
 /// A submitted frame's application: installs the frame on the render side
 /// and returns the `(surface, layer)` pairs the producer is bound on, so
 /// the frame's declared alpha contract is noted on each of them.
@@ -246,16 +255,15 @@ pub enum LayerOp {
 }
 
 /// One committed op: a layer mutation, or an opaque render-side install a
-/// capability method wrapped (GPU content, external frames) travelling in
-/// order with the layer ops.
+/// capability method wrapped (GPU producers) travelling in order with the
+/// layer ops.
 pub enum Op<B: Backend> {
     /// A layer-tree mutation.
     Layer(LayerOp),
-    /// An opaque render-side operation, applied in order.
-    Install(ResOp<B>),
-    /// A render-side install replaced `layer`'s recorded content, so its
-    /// painted output is the producer's and not known to be opaque.
-    Installed(LayerId),
+    /// A render-side install on `layer`, applied in order: the reported
+    /// declared alpha is noted on the layer — `None`, no frame landed
+    /// yet, notes it not known opaque.
+    Install(LayerId, InstallApply<B>),
 }
 
 /// The committed change set for one surface.
